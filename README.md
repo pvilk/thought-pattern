@@ -1,10 +1,28 @@
 # Wispr Thoughts
 
-> **Journal out loud.** If you don't write a daily journal but you talk while you work, this tool quietly catches everything you said, groups it by week, and shows you patterns you never noticed you were saying. It overlaps your solo voice notes with your meeting transcripts so the same idea showing up in both is highlighted automatically.
+> a time machine through everything you've voiced.
+
+wispr thoughts is an open-source project that takes everything you've ever dictated through wispr flow, groups it by week, and makes it searchable and easy to converse with. ask yourself what you were working on, what you keep almost-saying, or what you've been quietly avoiding.
+
+everything runs locally on your laptop. nothing syncs to any cloud, no account, no telemetry. you fully own your data.
 
 ![Wispr Thoughts weekly viewer](assets/viewer.png)
 
-This is a self-mirror, not analytics. The system doesn't tell you what to do. It shows you what's been on your mind for eight weeks without resolution, what gets renamed every two weeks but never built, and what you keep almost-saying but never quite getting to. You read the digest once a week and decide what to do with it. **No signup, no account, no Anthropic API key, and no email setup required.** The local viewer is the primary output, and everything in the pipeline runs through your existing Claude Code subscription.
+## What you can ask it
+
+> "read all my themes from january. what was i working on then? in hindsight, were those actually problems worth solving?"
+
+> "what do i keep almost-saying but never quite getting to? half-finished thoughts, themes that surface and disappear."
+
+> "if you only saw my last 90 days of dictation and meetings, what would you say i'm avoiding?"
+
+> "pretend you're an advisor who only has my voice. based on the last month, what's the one piece of advice you'd give?"
+
+> "looking across everything i've said, what does it reveal about my real priorities, not my stated ones? where do my words and my actual time disagree?"
+
+> "if a board member or co-founder only had my voice and meetings to evaluate me, what would they conclude about my strategic clarity, focus, and execution quality?"
+
+The local viewer is the primary output, and everything in the pipeline runs through your existing Claude Code subscription. **No signup, no account, no Anthropic API key, and no email setup required.**
 
 ## Who this is for
 
