@@ -1,0 +1,44 @@
+name: Guard against data/ paths
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# This workflow fails any push or PR whose tree contains files under data/.
+# It's a redundant defense behind the local pre-commit hook and the
+# scripts/check-public.sh audit, so even if both of those are bypassed
+# (e.g., --no-verify), GitHub itself rejects the change.
+
+jobs:
+  no-data-paths:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Refuse if data/ files are tracked at HEAD
+        run: |
+          set -e
+          tracked=$(git ls-tree -r HEAD --name-only | grep '^data/' || true)
+          if [ -n "$tracked" ]; then
+            echo "::error::Found tracked files under data/. data/ is the personal corpus directory and must never be committed."
+            echo "$tracked" | sed 's/^/  /' | head -20
+            exit 1
+          fi
+          echo "Clean: no tracked files under data/"
+
+      - name: Refuse if credential patterns appear in tracked files
+        run: |
+          set -e
+          PATTERN='sk-(proj-|ant-|live_|test_)?[A-Za-z0-9_-]{20,}|xox[baprs]-[A-Za-z0-9-]{20,}|gh[ps]_[A-Za-z0-9]{30,}|AKIA[A-Z0-9]{16}'
+          # Exclude the hook + audit script (they contain the pattern definition itself)
+          hits=$(git grep -l -E "$PATTERN" -- ':!scripts/pre-commit' ':!scripts/check-public.sh' ':!.github/' 2>/dev/null || true)
+          if [ -n "$hits" ]; then
+            echo "::error::Found credential-shaped strings in tracked files."
+            echo "$hits" | sed 's/^/  /'
+            exit 1
+          fi
+          echo "Clean: no credential patterns in tracked files"

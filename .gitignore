@@ -1,0 +1,57 @@
+# Wispr Thoughts: never push personal data to git.
+
+# Local config with secrets / paths
+config.local.toml
+.env
+.env.local
+
+# Lock files
+*.lock
+
+# Personal denylist (lives under .git/hooks/, but belt-and-suspenders)
+personal-denylist.txt
+
+# Blanket: every directory under data/ is local-only.
+# This is the single most important line in this file.
+data/
+
+# Belt-and-suspenders for older paths that pre-date the data/ convention,
+# in case a user has a legacy layout. Match anywhere in the tree.
+flow.sqlite*
+entries/
+weeks/
+meetings/
+master/40_per_meeting/
+master/50_weeks/
+master/30_condensations/
+master/20_trends/
+master/10_extracts/
+granola_export/
+digests/
+logs/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# macOS
+.DS_Store
+
+# Editors
+.idea/
+.vscode/
+*.swp
+
+# Temp scratch
+*.tmp
+*.bak
+.tmp/
+.tmp-test/
+
+# IMPORTANT: do NOT add `scripts/` here. `scripts/pre-commit` and
+# `scripts/personal-denylist.example.txt` are intentionally committed.
+# `.git/hooks/personal-denylist.txt` (the active denylist) is private,
+# but git already ignores .git/ contents.

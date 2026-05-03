@@ -1,0 +1,22 @@
+# Personal denylist for the pre-commit hook (template).
+#
+# Copy this file to .git/hooks/personal-denylist.txt and edit it
+# with terms YOU want the hook to block. One term per line.
+# Lines starting with # are comments. Empty lines are ignored.
+# Matching is case-insensitive against added lines in staged diffs.
+#
+# Bootstrap.sh handles this automatically; it runs `cp scripts/personal-denylist.example.txt .git/hooks/personal-denylist.txt`
+# and prompts you to edit it on first setup.
+#
+# Suggested categories of terms to add:
+#   - Your full name and any initials/handles
+#   - Your personal email addresses
+#   - Your company name and brands you operate
+#   - Names of clients, collaborators, or family members you mention often
+#   - Internal project codenames you don't want public
+#
+# Example (DELETE these and add your own):
+# yourname
+# yourcompany
+# clientbrand
+# yourname@yourdomain.com

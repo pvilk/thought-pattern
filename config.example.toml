@@ -1,0 +1,84 @@
+# Local config for Wispr Thoughts.
+#
+# Copy this file to `config.local.toml` (gitignored) and toggle the sources
+# you want enabled. Or run `./bootstrap.sh` (or just open the repo in Claude
+# Code) to walk through this interactively.
+#
+# The local HTML viewer is the primary way to read your weekly digests.
+# Email is OFF by default. Enable it later if you want.
+
+[llm]
+# Backend: "cli" (default. uses your local `claude -p` from Claude Code,
+# free with your existing subscription, no API key needed). Two other
+# values exist for advanced users: "api" (direct Anthropic Messages API,
+# requires key in keychain) and "auto" (cli first, fall back to api).
+# Most people should leave this on "cli".
+backend = "cli"
+
+# Default model. Sonnet handles 1M context (best for big weeks).
+model = "claude-sonnet-4-6"
+
+# Keychain service for the optional Anthropic API key (only consulted if
+# backend = "api" or "auto"). Default backend "cli" never reads this, so
+# leave it alone unless you explicitly want the API path.
+api_keychain_service = "wispr-thoughts-anthropic-api"
+
+[sources]
+# Wispr Flow voice dictation (local SQLite). Disable if you don't use Wispr.
+[sources.wispr]
+enabled  = true
+db_path  = "~/Library/Application Support/Wispr Flow/flow.sqlite"
+
+# Fathom meeting transcripts (cloud, requires API key as env var).
+# Disable if you don't use Fathom.
+[sources.fathom]
+enabled       = false
+api_key_env   = "FATHOM_API_KEY"
+
+# Granola meeting transcripts (local Mac app cache). Disable if not used.
+[sources.granola]
+enabled       = true
+data_dir      = "~/Library/Application Support/Granola"
+
+# Apple Notes (iCloud-synced from iPhone, iPad, Mac). Read via the Notes app's
+# JXA interface; macOS prompts once for Automation permission. First export of
+# a large library takes a few minutes; later runs only refresh changed notes.
+# Note: notes export to data/notes/ as a parallel corpus; they are NOT mixed
+# into the weekly digest. Enable this only if you want the local corpus.
+[sources.notes]
+enabled       = false
+
+[paths]
+# Where corpus + analysis artifacts live (gitignored).
+entries_dir   = "data/entries"
+weeks_dir     = "data/weeks"
+meetings_dir  = "data/meetings"
+notes_dir     = "data/notes"
+digests_dir   = "data/digests"
+master_dir    = "data/master"
+logs_dir      = "data/logs"
+
+[email]
+# Email is optional. The local viewer (`viewer` command) is the primary
+# output. Enable email later by setting enabled = true and adding a Gmail
+# app password to the keychain. Bootstrap can do this for you.
+enabled = false
+# When you do enable email, these defaults work for Gmail; change for
+# other providers.
+smtp_host = "smtp.gmail.com"
+smtp_port = 465
+smtp_user = "you@example.com"
+smtp_to   = "you@example.com"
+keychain_service = "wispr-thoughts-smtp"
+
+[schedule]
+# Day of week (0 = Sunday) and local time for the launchd auto-run.
+# Only used if you opt into scheduled runs.
+weekday = 0
+hour    = 8
+minute  = 0
+
+[server]
+# Local viewer server port. Bound to 127.0.0.1 only; never reachable beyond
+# your laptop. Override via THOUGHTPATTERN_PORT env var if 8080 is taken.
+port = 8080

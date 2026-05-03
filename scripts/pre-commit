@@ -1,0 +1,83 @@
+#!/bin/bash
+# Wispr Thoughts pre-commit hook: blocks personal data leaks.
+#
+# Three layers of defense run on every commit:
+#
+#   1. Refuse any staged path under data/, regardless of .gitignore state.
+#      .gitignore only blocks UNTRACKED files; this catches the case where
+#      someone force-added with `git add -f data/something` or where the file
+#      was tracked before .gitignore existed.
+#
+#   2. Refuse staged diffs containing known credential patterns (Anthropic
+#      API keys, OpenAI keys, GitHub tokens, AWS access keys, Slack tokens).
+#
+#   3. Refuse staged diffs whose added lines match terms from the local
+#      denylist at .git/hooks/personal-denylist.txt (your name, clients,
+#      brands, internal codenames).
+#
+# Bypass for a one-off legitimate commit: `git commit --no-verify`.
+
+set -e
+
+# ---- Layer 1: data/ paths --------------------------------------------------
+
+data_paths=$(git diff --staged --name-only --diff-filter=AM | grep -E '^data/' || true)
+if [ -n "$data_paths" ]; then
+    echo ""
+    echo "❌ pre-commit blocked: staged paths under data/ are never allowed in git."
+    echo ""
+    echo "Paths:"
+    echo "$data_paths" | sed 's/^/  /'
+    echo ""
+    echo "data/ holds your personal corpus and is gitignored. If git is offering"
+    echo "to commit these, the files were tracked BEFORE .gitignore existed."
+    echo "Untrack them with:"
+    echo "  git rm --cached -r data/"
+    echo "  git commit -m 'untrack data/ (already ignored)'"
+    echo ""
+    exit 1
+fi
+
+# ---- Layer 2: credential patterns -----------------------------------------
+
+CRED_PATTERN='sk-(proj-|ant-|live_|test_)?[A-Za-z0-9_-]{20,}|xox[baprs]-[A-Za-z0-9-]{20,}|gh[ps]_[A-Za-z0-9]{30,}|AKIA[A-Z0-9]{16}'
+cred_hits=$(git diff --staged --diff-filter=AM | grep -E '^\+' | grep -E "$CRED_PATTERN" | head -5 || true)
+if [ -n "$cred_hits" ]; then
+    echo ""
+    echo "❌ pre-commit blocked: staged changes contain what looks like API credentials."
+    echo ""
+    echo "Matches (redacted to first 40 chars):"
+    echo "$cred_hits" | sed 's/^/  /' | cut -c1-80
+    echo ""
+    echo "Move the credential to a keychain entry or an env var, then re-stage."
+    echo ""
+    exit 1
+fi
+
+# ---- Layer 3: personal denylist -------------------------------------------
+
+DENYLIST_FILE="$(dirname "$0")/personal-denylist.txt"
+[ -f "$DENYLIST_FILE" ] || exit 0
+[ -s "$DENYLIST_FILE" ] || exit 0
+
+# Build a regex alternation from the denylist (one term per line; # = comment).
+PATTERN=$(grep -v '^#' "$DENYLIST_FILE" | grep -v '^$' | paste -sd '|' -)
+[ -z "$PATTERN" ] && exit 0
+
+# Grep only the added lines in the staged diff for case-insensitive matches.
+hits=$(git diff --staged --diff-filter=AM | grep -E '^\+' | grep -iE "($PATTERN)" | head -10 || true)
+
+if [ -n "$hits" ]; then
+    echo ""
+    echo "❌ pre-commit blocked: staged changes contain terms from your denylist."
+    echo ""
+    echo "Matches:"
+    echo "$hits" | sed 's/^/  /'
+    echo ""
+    echo "Either edit the files to remove the terms and re-stage,"
+    echo "or commit with --no-verify if it's a legitimate occurrence."
+    echo ""
+    exit 1
+fi
+
+exit 0
