@@ -150,27 +150,16 @@ def render_items(items: list[tuple[str, str, str]]) -> str:
     return "\n".join(lines)
 
 
-def extract_section(text: str, header_pattern: str) -> tuple[str, str] | None:
-    """Pull (heading, body) for a section. Returns None if not present."""
-    pat = re.compile(
-        rf"##\s*({header_pattern})\s*\n+(.*?)(?=\n##|\Z)",
-        flags=re.DOTALL,
-    )
-    m = pat.search(text)
-    return (m.group(1).strip(), m.group(2).strip()) if m else None
-
-
 def has_themed_content(label: str) -> bool:
-    """True iff the week has at least one themed item or auditor section.
+    """True iff the week has at least one Themes or Problems item.
 
-    A "themed" week has either a Themes/Problems item from voice or meetings,
-    or an auditor section in the digest. Weeks where Wispr export ran but
-    theming hasn't fired yet (placeholder file only) return False so they
-    never surface in the viewer until they're actually populated.
+    Auditor "What I noticed" sections aren't shown in the viewer anymore, so
+    they don't qualify a week as themed on their own. Weeks where Wispr
+    export ran but theming hasn't fired yet (placeholder file only) return
+    False so they never surface until they're actually populated.
     """
     voice_path = WEEKS_DIR / f"{label}.md"
     meeting_path = MEETING_WEEKS_DIR / f"{label}.md"
-    digest_path = DIGESTS_DIR / f"{label}.md"
 
     voice_text = voice_path.read_text() if voice_path.exists() else ""
     meeting_text = meeting_path.read_text() if meeting_path.exists() else ""
@@ -179,15 +168,7 @@ def has_themed_content(label: str) -> bool:
     meeting_themes = parse_items_from_section(meeting_text, "On my mind", r".+")
     voice_problems = parse_items_from_section(voice_text, r"Problems\s*I[\'’]m solving", r".+")
     meeting_problems = parse_items_from_section(meeting_text, r"Problems\s*I[\'’]m solving", r".+")
-    if voice_themes or meeting_themes or voice_problems or meeting_problems:
-        return True
-
-    if digest_path.exists():
-        digest_text = digest_path.read_text()
-        for pattern in [r"What I noticed \(in conversation\)", r"What I noticed[^—\n(]*"]:
-            if extract_section(digest_text, pattern):
-                return True
-    return False
+    return bool(voice_themes or meeting_themes or voice_problems or meeting_problems)
 
 
 def assemble_week_markdown(label: str) -> str:
@@ -195,12 +176,13 @@ def assemble_week_markdown(label: str) -> str:
 
     Drops Stats / Voice-wrapper / Meetings-this-week sections.
     Consolidates voice + meeting themes/problems into ONE list each, with
-    source pills marking which corpus surfaced each item.
-    Keeps the auditor sections (What I noticed) when a digest exists.
+    source pills marking which corpus surfaced each item. Auditor sections
+    (What I noticed) are intentionally NOT rendered — the viewer is the
+    weekly recap surface; cross-week analysis lives in
+    data/master/20_trends/ and digest emails for users who want it.
     """
     voice_path = WEEKS_DIR / f"{label}.md"
     meeting_path = MEETING_WEEKS_DIR / f"{label}.md"
-    digest_path = DIGESTS_DIR / f"{label}.md"
 
     voice_text = voice_path.read_text() if voice_path.exists() else ""
     meeting_text = meeting_path.read_text() if meeting_path.exists() else ""
@@ -215,24 +197,13 @@ def assemble_week_markdown(label: str) -> str:
     meeting_problems = parse_items_from_section(meeting_text, r"Problems\s*I[\'’]m solving", r".+")
     problems = merge_sources(voice_problems, meeting_problems)
 
-    # Auditor sections (only present when a digest was generated for this week)
-    auditor_sections: list[tuple[str, str]] = []
-    if digest_path.exists():
-        digest_text = digest_path.read_text()
-        for pattern in [r"What I noticed \(in conversation\)", r"What I noticed[^—\n(]*"]:
-            sec = extract_section(digest_text, pattern)
-            if sec and sec[0] not in {h for h, _ in auditor_sections}:
-                auditor_sections.append(sec)
-
     parts: list[str] = []
 
     if themes:
         parts += ["## On my mind", "", render_items(themes), ""]
     if problems:
         parts += ["## Problems I'm solving", "", render_items(problems), ""]
-    for heading, body in auditor_sections:
-        parts += [f"## {heading}", "", body, ""]
-    if not themes and not problems and not auditor_sections:
+    if not themes and not problems:
         # Distinguish "no raw data captured" from "raw data exists but theming
         # hasn't run yet." If a Wispr stub exists with the placeholder LLM line,
         # the user just needs to run the theming pass.
