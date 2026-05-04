@@ -58,18 +58,16 @@ digests_dir   = "data/digests"
 master_dir    = "data/master"
 logs_dir      = "data/logs"
 
-[email]
-# Email is optional. The local viewer (`viewer` command) is the primary
-# output. Enable email later by setting enabled = true and adding a Gmail
-# app password to the keychain. Bootstrap can do this for you.
+[delivery]
+# Email delivery via Resend (https://resend.com). Optional. The local
+# viewer is the primary output; flip enabled = true in the settings panel
+# to also receive a weekly email digest. The Resend API key lives in
+# ~/.zshrc as RESEND_API_KEY (set via the panel, never edit here).
 enabled = false
-# When you do enable email, these defaults work for Gmail; change for
-# other providers.
-smtp_host = "smtp.gmail.com"
-smtp_port = 465
-smtp_user = "you@example.com"
-smtp_to   = "you@example.com"
-keychain_service = "wispr-thoughts-smtp"
+# `onboarding@resend.dev` works without verifying a domain. Once you
+# verify your own domain on Resend, change this to e.g. "you@yourdomain.com".
+from_email = "onboarding@resend.dev"
+to_email   = "you@example.com"
 
 [schedule]
 # Day of week (0 = Sunday) and local time for the launchd auto-run.

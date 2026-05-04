@@ -749,6 +749,46 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       </div>
 
       <div class="settings-card">
+        <h3>Email digest (optional)</h3>
+        <div class="settings-row">
+          <div class="label-text">Email me each week</div>
+          <div class="control">
+            <label class="toggle">
+              <input type="checkbox" id="deliveryToggle">
+              <span class="slider"></span>
+            </label>
+          </div>
+        </div>
+        <!-- Everything below is hidden when the toggle is off -->
+        <div id="deliveryFields" hidden>
+          <div class="settings-row input">
+            <div class="label-text">Send to</div>
+            <div class="control">
+              <input type="email" id="deliveryTo" placeholder="you@gmail.com" autocomplete="off">
+            </div>
+          </div>
+          <div class="settings-row input">
+            <div>
+              <div class="label-text">Resend API key</div>
+              <div class="label-sub">
+                <a href="https://resend.com/api-keys" target="_blank" rel="noopener">Get a key →</a>
+              </div>
+            </div>
+            <div class="control" style="gap: 6px;">
+              <input type="password" id="deliveryKey" placeholder="re_••••••••••••••••" autocomplete="new-password">
+              <button class="sync-btn sync-btn-primary" id="deliveryKeyBtn">Save</button>
+            </div>
+          </div>
+          <div class="settings-row" style="margin-bottom: 0; grid-template-columns: 1fr;">
+            <div class="control" style="justify-self: end;">
+              <button class="sync-btn sync-btn-secondary" id="deliveryTestBtn">Send test email</button>
+            </div>
+          </div>
+          <div class="test-result" id="deliveryTestResult" hidden></div>
+        </div>
+      </div>
+
+      <div class="settings-card">
         <h3>Sources</h3>
         <div id="sourcesList"></div>
       </div>
@@ -1177,6 +1217,15 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   const FIXED_HOUR    = 8;
   const FIXED_MINUTE  = 0;
 
+  // Email delivery (Resend)
+  const deliveryToggleEl     = document.getElementById('deliveryToggle');
+  const deliveryFieldsEl     = document.getElementById('deliveryFields');
+  const deliveryToEl         = document.getElementById('deliveryTo');
+  const deliveryKeyEl        = document.getElementById('deliveryKey');
+  const deliveryKeyBtnEl     = document.getElementById('deliveryKeyBtn');
+  const deliveryTestBtnEl    = document.getElementById('deliveryTestBtn');
+  const deliveryTestResultEl = document.getElementById('deliveryTestResult');
+
   const sourcesListEl = document.getElementById('sourcesList');
 
   let syncOpen = false;
@@ -1193,16 +1242,29 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 
   async function loadSettings() {
     try {
-      const [setRes, schRes] = await Promise.all([
+      const [setRes, schRes, delRes] = await Promise.all([
         fetch('/api/settings',  { cache: 'no-store' }),
         fetch('/api/schedule', { cache: 'no-store' }),
+        fetch('/api/delivery', { cache: 'no-store' }),
       ]);
       if (!setRes.ok || !schRes.ok) throw new Error('settings load failed');
       const settings = await setRes.json();
       const schedule = await schRes.json();
+      const delivery = delRes.ok ? await delRes.json() : null;
 
       autoSyncToggleEl.checked = !!schedule.installed;
 
+      // Email delivery
+      if (delivery) {
+        deliveryToggleEl.checked = !!delivery.enabled;
+        deliveryFieldsEl.hidden  = !delivery.enabled;
+        deliveryToEl.value       = delivery.to_email || '';
+        deliveryKeyEl.value      = '';
+        // Two states for the API-key input + button:
+        //   key saved → input hidden, button reads "Replace"
+        //   key unset  → input visible, button reads "Save"
+        setApiKeySavedState(delivery.key_set);
+      }
 
       // Sources
       sourcesListEl.innerHTML = '';
@@ -1344,6 +1406,104 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   // Wire change handler for the auto-sync toggle. Schedule is fixed at
   // Sunday 8 AM, so there are no other inputs to listen on.
   autoSyncToggleEl.addEventListener('change', saveScheduleFromUI);
+
+  // ---------- Email delivery (Resend) ----------
+  // The Save/Replace button is one element with two states:
+  //   "Save"     → input is visible; click POSTs the pasted key
+  //   "Replace"  → input is hidden (a key is already saved); click reveals
+  //                the empty input + flips the button back to "Save"
+  function setApiKeySavedState(saved) {
+    deliveryKeyEl.hidden = !!saved;
+    deliveryKeyBtnEl.textContent = saved ? 'Replace' : 'Save';
+  }
+
+  async function saveDeliveryFromUI(extra = {}) {
+    if (!settingsLoaded) return null;
+    // From is hardcoded server-side (defaults to onboarding@resend.dev for
+    // unverified accounts; advanced users edit config.local.toml directly).
+    const body = {
+      enabled:  deliveryToggleEl.checked,
+      to_email: deliveryToEl.value.trim(),
+      ...extra,
+    };
+    try {
+      const r = await fetch('/api/delivery', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify(body),
+      });
+      if (!r.ok) {
+        const data = await r.json().catch(() => ({}));
+        showSavedHint(`Delivery save failed: ${data.error || r.status}`);
+        return null;
+      }
+      return await r.json();
+    } catch (e) {
+      showSavedHint(`Delivery save failed: ${e}`);
+      return null;
+    }
+  }
+
+  deliveryKeyBtnEl.addEventListener('click', async () => {
+    if (deliveryKeyBtnEl.textContent === 'Replace') {
+      // Reveal the input so the user can paste a new key
+      setApiKeySavedState(false);
+      deliveryKeyEl.value = '';
+      deliveryKeyEl.focus();
+      return;
+    }
+    const key = deliveryKeyEl.value.trim();
+    if (!key) { deliveryKeyEl.focus(); return; }
+    deliveryKeyBtnEl.disabled = true;
+    deliveryKeyBtnEl.textContent = 'Saving…';
+    const result = await saveDeliveryFromUI({ resend_api_key: key });
+    deliveryKeyBtnEl.disabled = false;
+    if (result) {
+      deliveryKeyEl.value = '';
+      setApiKeySavedState(true);
+      showSavedHint('Resend API key saved.');
+    } else {
+      // Restore button label so user can retry
+      deliveryKeyBtnEl.textContent = 'Save';
+    }
+  });
+
+  deliveryToggleEl.addEventListener('change', () => {
+    deliveryFieldsEl.hidden = !deliveryToggleEl.checked;
+    saveDeliveryFromUI().then(r => {
+      if (r) showSavedHint(deliveryToggleEl.checked ? 'Email digests enabled.' : 'Email digests disabled.');
+    });
+  });
+  // To address saves on blur to avoid spamming the endpoint per keystroke
+  deliveryToEl.addEventListener('blur', () => saveDeliveryFromUI());
+
+  deliveryTestBtnEl.addEventListener('click', async () => {
+    deliveryTestResultEl.hidden = true;
+    deliveryTestResultEl.classList.remove('ok', 'err');
+    // Save current address values before testing so the test uses what's on screen
+    await saveDeliveryFromUI();
+    deliveryTestBtnEl.disabled = true;
+    deliveryTestBtnEl.textContent = 'Sending…';
+    try {
+      const r = await fetch('/api/delivery/test', { method: 'POST' });
+      const data = await r.json().catch(() => ({}));
+      deliveryTestResultEl.hidden = false;
+      if (r.ok) {
+        deliveryTestResultEl.classList.add('ok');
+        deliveryTestResultEl.textContent = 'Test email sent. Check your inbox.';
+      } else {
+        deliveryTestResultEl.classList.add('err');
+        deliveryTestResultEl.textContent = `Failed: ${data.error || r.statusText}`;
+      }
+    } catch (e) {
+      deliveryTestResultEl.hidden = false;
+      deliveryTestResultEl.classList.add('err');
+      deliveryTestResultEl.textContent = `Failed: ${e}`;
+    } finally {
+      deliveryTestBtnEl.disabled = false;
+      deliveryTestBtnEl.textContent = 'Send test email';
+    }
+  });
 
   function openSyncModal() {
     syncOpen = true;

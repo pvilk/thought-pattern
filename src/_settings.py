@@ -1,21 +1,18 @@
 """Wispr Thoughts settings read/write.
 
 The viewer's settings drawer needs to mutate a small slice of config.local.toml
-(email enabled/recipient, schedule weekday/hour/minute, source toggles).
+(delivery toggle/recipient, schedule weekday/hour/minute, source toggles).
 Python's stdlib reads TOML via tomllib but doesn't write it, so we do
 surgical line-based edits for the keys the UI manages and leave the rest of
-the file untouched.
+the file untouched. Only the keys listed in WRITABLE can be touched here;
+everything else stays in the user's hands.
 
-Only six top-level scalar paths are writable here; everything else stays in
-the user's hands. This keeps the surface tiny and the diff tool-friendly.
-
-Email passwords go to the macOS Keychain via `security`, never to disk.
+API keys (Fathom, Resend) go to ~/.zshrc via _delivery.keys; not handled here.
 """
 
 from __future__ import annotations
 
 import re
-import subprocess
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -23,9 +20,10 @@ CONFIG_LOCAL = ROOT / "config.local.toml"
 
 # Path -> default. Anything not listed here is read-only from the UI.
 WRITABLE: dict[tuple[str, str], object] = {
-    ("email", "enabled"):  False,
-    ("email", "smtp_to"):  "you@example.com",
-    ("email", "smtp_user"): "you@example.com",
+    # Resend-based delivery (Gmail SMTP path was removed)
+    ("delivery", "enabled"):    False,
+    ("delivery", "from_email"): "onboarding@resend.dev",
+    ("delivery", "to_email"):   "you@example.com",
     ("schedule", "weekday"): 0,
     ("schedule", "hour"):    9,
     ("schedule", "minute"):  0,
@@ -123,29 +121,3 @@ def write_keys(updates: dict[tuple[str, str], object]) -> None:
     CONFIG_LOCAL.write_text(text)
 
 
-# --- Keychain ops -----------------------------------------------------------
-
-
-def keychain_set(service: str, account: str, password: str) -> None:
-    """Add/update a generic password in the macOS Keychain."""
-    # Delete first if it exists; security add-generic-password without -U
-    # rejects duplicates. We avoid -U because `security` man page warns about
-    # ACL inheritance differences across macOS versions.
-    subprocess.run(
-        ["security", "delete-generic-password", "-s", service, "-a", account],
-        capture_output=True, text=True,
-    )
-    r = subprocess.run(
-        ["security", "add-generic-password", "-s", service, "-a", account, "-w", password],
-        capture_output=True, text=True,
-    )
-    if r.returncode != 0:
-        raise RuntimeError(r.stderr.strip() or "security add-generic-password failed")
-
-
-def keychain_has(service: str, account: str) -> bool:
-    r = subprocess.run(
-        ["security", "find-generic-password", "-s", service, "-a", account, "-w"],
-        capture_output=True, text=True,
-    )
-    return r.returncode == 0

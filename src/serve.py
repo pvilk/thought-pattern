@@ -17,6 +17,9 @@ and exposes a JSON API for the sync pill in the viewer:
     POST /api/schedule      -> { ok } installs/removes the launchd job
     GET  /api/backfill      -> { unthemed_count, weeks: list[str] }
     POST /api/backfill      -> { job_id } runs themes for every unthemed week
+    GET  /api/delivery      -> { enabled, from_email, to_email, key_set }
+    POST /api/delivery      -> save delivery config + (optional) Resend API key
+    POST /api/delivery/test -> send a test email through the configured backend
 
 Bound to 127.0.0.1 only. Never reachable from outside the laptop. No auth on
 purpose; the network bind is the access boundary.
@@ -47,9 +50,11 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse
 
+import _delivery
 import _schedule
 import _settings
 from _config import load as load_config, resolve_path
+from _delivery import keys as _delivery_keys
 
 CFG = load_config()
 
@@ -338,39 +343,12 @@ def _start_backfill_thread(job: dict, weeks: list[str]) -> None:
     t.start()
 
 
-# --- Fathom API key persistence ---------------------------------------------
-
-
-_FATHOM_LINE_RE = None  # populated lazily
+# --- API key persistence ----------------------------------------------------
 
 
 def _persist_fathom_key(key: str) -> None:
-    """Write `export FATHOM_API_KEY='<key>'` to ~/.zshrc and the current process.
-
-    The launchd job runs the pipeline via `bash -lc`, which sources ~/.zshrc,
-    so persisting there means both manual shells and the cron pick it up
-    after the next sync.
-    """
-    import re as _re
-    zshrc = Path.home() / ".zshrc"
-    safe = key.replace("'", "'\\''")
-    new_line = f"export FATHOM_API_KEY='{safe}'"
-    pat = _re.compile(r"^\s*export\s+FATHOM_API_KEY=.*$", _re.MULTILINE)
-
-    if zshrc.exists():
-        text = zshrc.read_text()
-        if pat.search(text):
-            text = pat.sub(new_line, text)
-        else:
-            if not text.endswith("\n"):
-                text += "\n"
-            text += new_line + "\n"
-    else:
-        text = new_line + "\n"
-    zshrc.write_text(text)
-    # Make it usable for any subsequent /api/sync the user kicks off in this
-    # server process (without requiring a server restart).
-    os.environ["FATHOM_API_KEY"] = key
+    """Write FATHOM_API_KEY to ~/.zshrc and the current process env."""
+    _delivery_keys.persist_env_key("FATHOM_API_KEY", key)
 
 
 # --- Source detection (read-only for the settings drawer) -------------------
@@ -431,6 +409,8 @@ class WisprThoughtsHandler(BaseHTTPRequestHandler):
             return self._get_schedule()
         if path == "/api/backfill":
             return self._get_backfill()
+        if path == "/api/delivery":
+            return self._get_delivery()
         return self._serve_static(path)
 
     def do_POST(self) -> None:
@@ -441,12 +421,14 @@ class WisprThoughtsHandler(BaseHTTPRequestHandler):
             return self._cancel_sync()
         if path == "/api/settings":
             return self._post_settings()
-        if path == "/api/settings/email/test":
-            return self._post_email_test()
         if path == "/api/schedule":
             return self._post_schedule()
         if path == "/api/backfill":
             return self._start_backfill()
+        if path == "/api/delivery":
+            return self._post_delivery()
+        if path == "/api/delivery/test":
+            return self._post_delivery_test()
         self.send_error(HTTPStatus.NOT_FOUND, "Unknown POST endpoint")
 
     # ---- Helpers for body parsing ------------------------------------------
@@ -595,22 +577,9 @@ class WisprThoughtsHandler(BaseHTTPRequestHandler):
 
     def _get_settings(self) -> None:
         cfg = load_config()
-        email_cfg = cfg.get("email", {}) or {}
         schedule_cfg = cfg.get("schedule", {}) or {}
         sources_cfg = cfg.get("sources", {}) or {}
         body = {
-            "email": {
-                "enabled": bool(email_cfg.get("enabled", False)),
-                "smtp_to": email_cfg.get("smtp_to", ""),
-                "smtp_user": email_cfg.get("smtp_user", ""),
-                "smtp_host": email_cfg.get("smtp_host", "smtp.gmail.com"),
-                "smtp_port": email_cfg.get("smtp_port", 465),
-                "keychain_service": email_cfg.get("keychain_service", "wispr-thoughts-smtp"),
-                "password_set": _settings.keychain_has(
-                    email_cfg.get("keychain_service", "wispr-thoughts-smtp"),
-                    email_cfg.get("smtp_user", ""),
-                ) if email_cfg.get("smtp_user") else False,
-            },
             "schedule": {
                 "weekday": int(schedule_cfg.get("weekday", 0)),
                 "hour":    int(schedule_cfg.get("hour", 9)),
@@ -637,24 +606,6 @@ class WisprThoughtsHandler(BaseHTTPRequestHandler):
             return
 
         updates: dict[tuple[str, str], object] = {}
-        if "email" in data and isinstance(data["email"], dict):
-            e = data["email"]
-            if "enabled" in e:   updates[("email", "enabled")]   = bool(e["enabled"])
-            if "smtp_to" in e:   updates[("email", "smtp_to")]   = str(e["smtp_to"])
-            if "smtp_user" in e: updates[("email", "smtp_user")] = str(e["smtp_user"])
-            password = e.get("password")
-            if password:
-                # Best-effort write the password to the keychain. Use the
-                # current config's keychain_service + the new smtp_user.
-                cfg = load_config()
-                svc = (cfg.get("email", {}) or {}).get("keychain_service", "wispr-thoughts-smtp")
-                acct = e.get("smtp_user") or (cfg.get("email", {}) or {}).get("smtp_user", "")
-                if acct:
-                    try:
-                        _settings.keychain_set(svc, acct, password)
-                    except Exception as exc:
-                        self._json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": f"keychain: {exc}"})
-                        return
         if "schedule" in data and isinstance(data["schedule"], dict):
             s = data["schedule"]
             if "weekday" in s: updates[("schedule", "weekday")] = int(s["weekday"])
@@ -688,44 +639,53 @@ class WisprThoughtsHandler(BaseHTTPRequestHandler):
 
         self._json(HTTPStatus.OK, {"ok": True})
 
-    def _post_email_test(self) -> None:
-        # Lazy import: weekly_email pulls the LLM client + every adapter, no
-        # need to load on server start.
-        try:
-            from importlib import util
-            spec = util.spec_from_file_location(
-                "weekly_email",
-                str(Path(__file__).resolve().parent / "weekly_email.py"),
-            )
-            mod = util.module_from_spec(spec)
-            spec.loader.exec_module(mod)
-        except Exception as e:
-            self._json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": f"import: {e}"})
+    # ---- Delivery (Resend) --------------------------------------------------
+
+    def _get_delivery(self) -> None:
+        self._json(HTTPStatus.OK, _delivery.is_configured())
+
+    def _post_delivery(self) -> None:
+        data = self._read_json_body()
+        if data is None:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid JSON"})
             return
 
+        # API key first (so a single POST can save key + addresses + toggle)
+        key = data.get("resend_api_key")
+        if isinstance(key, str) and key.strip():
+            try:
+                _delivery_keys.persist_env_key("RESEND_API_KEY", key.strip())
+            except Exception as exc:
+                self._json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": f"key: {exc}"})
+                return
+
+        # Then config fields. Surgical writes via _settings.
+        updates: dict[tuple[str, str], object] = {}
+        if "enabled"    in data: updates[("delivery", "enabled")]    = bool(data["enabled"])
+        if "from_email" in data: updates[("delivery", "from_email")] = str(data["from_email"]).strip()
+        if "to_email"   in data: updates[("delivery", "to_email")]   = str(data["to_email"]).strip()
+        if updates:
+            # Make sure these keys are writable (added in this commit)
+            for k in updates:
+                _settings.WRITABLE.setdefault(k, "")
+            try:
+                _settings.write_keys(updates)
+            except Exception as exc:
+                self._json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": f"write: {exc}"})
+                return
+
+        self._json(HTTPStatus.OK, {"ok": True, **_delivery.is_configured()})
+
+    def _post_delivery_test(self) -> None:
         try:
-            sample = (
-                "# Wispr Thoughts is working\n"
-                "\n"
-                "Your **SMTP config** and keychain password are wired up correctly.\n"
-                "From now on, every week's digest will arrive in this inbox.\n"
-                "\n"
-                "## What you'll see each Sunday\n"
-                "\n"
-                "- The themes that surfaced in your dictation and meetings\n"
-                "- Problems you've been working on\n"
-                "- Cross-week patterns the auditor caught\n"
-                "\n"
-                "_You can stop these any time from the settings panel in the local viewer._\n"
-            )
-            mod.send_email("test", sample, partial=False)
-        except SystemExit as e:
-            self._json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(e)})
+            resp = _delivery.send_test()
+        except _delivery.ResendError as e:
+            self._json(HTTPStatus.BAD_GATEWAY, {"error": e.message, "status": e.status})
             return
         except Exception as e:
             self._json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(e)})
             return
-        self._json(HTTPStatus.OK, {"ok": True})
+        self._json(HTTPStatus.OK, {"ok": True, "id": resp.get("id")})
 
     # ---- Backfill -----------------------------------------------------------
 
