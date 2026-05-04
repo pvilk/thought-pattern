@@ -239,15 +239,21 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 <link rel="apple-touch-icon" href="apple-touch-icon.png">
 <script src="https://cdn.jsdelivr.net/npm/marked@13/marked.min.js"></script>
 <style>
+  /* Newspaper palette: warm cream paper, dark warm-black ink, classic blue
+     links. Light is the default; data-theme="dark" on <html> flips to a
+     warm-dark inverse. Theme toggle in the top-right persists choice in
+     localStorage. */
   :root {
-    --bg: #ffffff; --fg: #1a1a1a; --muted: #6b6b6b; --accent: #4a6cf7;
-    --border: #e5e5e7; --code-bg: #f5f5f7; --hover: #f0f0f0;
-    --shadow: 0 12px 40px rgba(0,0,0,0.12), 0 2px 6px rgba(0,0,0,0.06);
+    color-scheme: light;
+    --bg: #faf6ec; --fg: #1c1916; --muted: #756f63; --accent: #1d4ed8;
+    --border: #e6dfd0; --code-bg: #f3eedf; --hover: #f0e9d8;
+    --shadow: 0 12px 40px rgba(28,25,22,0.12), 0 2px 6px rgba(28,25,22,0.06);
   }
-  @media (prefers-color-scheme: dark) {
-    :root { --bg: #0f0f10; --fg: #e8e8ea; --muted: #8a8a8e; --accent: #7c8fff;
-            --border: #2a2a2d; --code-bg: #1a1a1d; --hover: #1f1f22;
-            --shadow: 0 12px 40px rgba(0,0,0,0.55), 0 2px 6px rgba(0,0,0,0.4); }
+  :root[data-theme="dark"] {
+    color-scheme: dark;
+    --bg: #1a1614; --fg: #ece5d4; --muted: #8c8479; --accent: #93c5fd;
+    --border: #2d2723; --code-bg: #221c19; --hover: #2a221d;
+    --shadow: 0 12px 40px rgba(0,0,0,0.55), 0 2px 6px rgba(0,0,0,0.4);
   }
   * { box-sizing: border-box; }
   html, body { margin: 0; padding: 0; }
@@ -263,9 +269,27 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     position: relative;
   }
 
-  /* Sync pill, top-right of hero */
-  .sync-pill {
+  /* Top-right cluster: theme toggle + sync pill */
+  .corner-controls {
     position: absolute; top: 24px; right: 24px;
+    display: flex; align-items: center; gap: 8px;
+  }
+  .theme-toggle {
+    background: var(--bg); border: 1px solid var(--border);
+    color: var(--muted); cursor: pointer; padding: 0;
+    width: 30px; height: 30px; border-radius: 999px;
+    display: inline-flex; align-items: center; justify-content: center;
+    transition: background 0.1s, color 0.1s, border-color 0.1s;
+  }
+  .theme-toggle:hover { background: var(--hover); color: var(--fg); }
+  .theme-toggle svg { width: 14px; height: 14px; }
+  /* Show moon in light mode, sun in dark mode */
+  .theme-toggle .icon-sun { display: none; }
+  :root[data-theme="dark"] .theme-toggle .icon-moon { display: none; }
+  :root[data-theme="dark"] .theme-toggle .icon-sun  { display: block; }
+
+  /* Sync pill */
+  .sync-pill {
     background: var(--bg); border: 1px solid var(--border);
     color: var(--muted); cursor: pointer; padding: 6px 12px;
     border-radius: 999px; font-size: 12px; font-family: inherit;
@@ -292,7 +316,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     50%      { opacity: 1;   transform: scale(1.2); }
   }
   @media (max-width: 560px) {
-    .sync-pill { position: static; margin: 0 auto 16px; }
+    .corner-controls { position: static; justify-content: center; margin: 0 auto 16px; }
   }
   .hero h1 {
     font-family: ui-serif, "New York", Charter, Cambria, Georgia, serif;
@@ -382,11 +406,6 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   .src-tag.both {
     background: rgba(245,158,11,0.14); color: rgb(180,83,9);
     border: 1px solid rgba(245,158,11,0.4);
-  }
-  @media (prefers-color-scheme: dark) {
-    .src-tag.voice { color: var(--accent); border-color: rgba(124,143,255,0.4); }
-    .src-tag.meeting { color: rgb(74,222,128); border-color: rgba(74,222,128,0.4); }
-    .src-tag.both { color: rgb(251,191,36); border-color: rgba(251,191,36,0.5); }
   }
   main code {
     background: var(--code-bg); padding: 2px 6px; border-radius: 4px;
@@ -535,10 +554,6 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     background: transparent; color: var(--muted);
     border: 1px dashed var(--border);
   }
-  @media (prefers-color-scheme: dark) {
-    .src-status.detected { color: rgb(74,222,128); }
-  }
-
   .sync-log {
     background: var(--code-bg); border: 1px solid var(--border);
     border-radius: 10px; padding: 12px 14px; margin: 0 0 14px;
@@ -570,9 +585,6 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   }
   .test-result.ok { color: rgb(22,163,74); }
   .test-result.err { color: rgb(220,38,38); }
-  @media (prefers-color-scheme: dark) {
-    .test-result.ok { color: rgb(74,222,128); }
-  }
 
   /* Prompts modal (P key, footer link, click outside to close) */
   .prompts-overlay {
@@ -647,10 +659,6 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     border-color: rgba(34,197,94,0.4);
     color: rgb(22,163,74);
   }
-  @media (prefers-color-scheme: dark) {
-    .copy-btn.copied { color: rgb(74,222,128); }
-  }
-
   .meta {
     color: var(--muted); font-size: 12px; padding: 32px 24px 48px;
     text-align: center;
@@ -669,10 +677,28 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 <body>
 
 <div class="hero">
-  <button class="sync-pill" id="syncPill" title="Click to sync your data">
-    <span class="sync-dot" id="syncDot"></span>
-    <span class="sync-label" id="syncLabel">Checking…</span>
-  </button>
+  <div class="corner-controls">
+    <button class="theme-toggle" id="themeToggle" title="Toggle light/dark" aria-label="Toggle theme">
+      <svg class="icon-moon" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/>
+      </svg>
+      <svg class="icon-sun" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <circle cx="12" cy="12" r="4"/>
+        <line x1="12" y1="2"  x2="12" y2="4"/>
+        <line x1="12" y1="20" x2="12" y2="22"/>
+        <line x1="4.93"  y1="4.93"  x2="6.34"  y2="6.34"/>
+        <line x1="17.66" y1="17.66" x2="19.07" y2="19.07"/>
+        <line x1="2"  y1="12" x2="4"  y2="12"/>
+        <line x1="20" y1="12" x2="22" y2="12"/>
+        <line x1="4.93"  y1="19.07" x2="6.34"  y2="17.66"/>
+        <line x1="17.66" y1="6.34"  x2="19.07" y2="4.93"/>
+      </svg>
+    </button>
+    <button class="sync-pill" id="syncPill" title="Click to sync your data">
+      <span class="sync-dot" id="syncDot"></span>
+      <span class="sync-label" id="syncLabel">Checking…</span>
+    </button>
+  </div>
   <h1>Weekly Digest</h1>
   <div class="nav-row">
     <button class="nav-btn" id="prev" title="Previous week (←)">‹</button>
@@ -834,6 +860,21 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 </div>
 
 <script>
+  // ---------- Theme toggle (must run before any paint) ----------
+  const THEME_KEY = 'wispr-theme';
+  function applyTheme(theme) {
+    if (theme === 'dark') document.documentElement.dataset.theme = 'dark';
+    else delete document.documentElement.dataset.theme;
+  }
+  try {
+    applyTheme(localStorage.getItem(THEME_KEY) || 'light');
+  } catch {}
+  document.getElementById('themeToggle').addEventListener('click', () => {
+    const next = document.documentElement.dataset.theme === 'dark' ? 'light' : 'dark';
+    applyTheme(next);
+    try { localStorage.setItem(THEME_KEY, next); } catch {}
+  });
+
   const WEEKS = __WEEKS_JSON__;
 
   // Default to the most recently *completed* week (Saturday in the past), not
