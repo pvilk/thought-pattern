@@ -1,6 +1,11 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<!-- Wispr Thoughts Sunday 8am local weekly digest. Bootstrap fills the {{...}} placeholders. -->
+<!--
+  Wispr Thoughts weekly auto-sync. The settings drawer in the viewer renders
+  this template into ~/Library/LaunchAgents/io.wisprthoughts.weekly.plist
+  and runs `launchctl bootstrap` to register it. {{...}} placeholders are
+  filled in by src/_schedule.py at install time.
+-->
 <plist version="1.0">
 <dict>
     <key>Label</key>
@@ -8,9 +13,12 @@
 
     <key>ProgramArguments</key>
     <array>
-        <string>/bin/bash</string>
+        <!-- zsh, not bash. macOS default shell since Catalina is zsh, and the
+             user's API keys live in ~/.zshrc. `bash -lc` would source
+             ~/.bash_profile only and silently miss the Fathom key. -->
+        <string>/bin/zsh</string>
         <string>-lc</string>
-        <string>cd "{{INSTALL_PATH}}" && /Library/Frameworks/Python.framework/Versions/3.12/bin/python3 src/weekly_email.py</string>
+        <string>cd "{{INSTALL_PATH}}" && {{PYTHON}} src/weekly_email.py >> "{{HOME}}/Library/Logs/wispr-thoughts.out.log" 2>&1</string>
     </array>
 
     <key>WorkingDirectory</key>
@@ -19,11 +27,11 @@
     <key>StartCalendarInterval</key>
     <dict>
         <key>Weekday</key>
-        <integer>0</integer>
+        <integer>{{WEEKDAY}}</integer>
         <key>Hour</key>
-        <integer>8</integer>
+        <integer>{{HOUR}}</integer>
         <key>Minute</key>
-        <integer>0</integer>
+        <integer>{{MINUTE}}</integer>
     </dict>
 
     <key>RunAtLoad</key>
@@ -38,9 +46,7 @@
     <key>EnvironmentVariables</key>
     <dict>
         <key>PATH</key>
-        <string>{{HOME}}/.npm-global/bin:/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin</string>
-        <key>WISPRTHOUGHTS_LLM_BACKEND</key>
-        <string>api</string>
+        <string>{{HOME}}/.npm-global/bin:{{HOME}}/bin:/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin</string>
     </dict>
 </dict>
 </plist>

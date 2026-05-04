@@ -160,6 +160,36 @@ def extract_section(text: str, header_pattern: str) -> tuple[str, str] | None:
     return (m.group(1).strip(), m.group(2).strip()) if m else None
 
 
+def has_themed_content(label: str) -> bool:
+    """True iff the week has at least one themed item or auditor section.
+
+    A "themed" week has either a Themes/Problems item from voice or meetings,
+    or an auditor section in the digest. Weeks where Wispr export ran but
+    theming hasn't fired yet (placeholder file only) return False so they
+    never surface in the viewer until they're actually populated.
+    """
+    voice_path = WEEKS_DIR / f"{label}.md"
+    meeting_path = MEETING_WEEKS_DIR / f"{label}.md"
+    digest_path = DIGESTS_DIR / f"{label}.md"
+
+    voice_text = voice_path.read_text() if voice_path.exists() else ""
+    meeting_text = meeting_path.read_text() if meeting_path.exists() else ""
+
+    voice_themes = parse_items_from_section(voice_text, "On my mind", r".+")
+    meeting_themes = parse_items_from_section(meeting_text, "On my mind", r".+")
+    voice_problems = parse_items_from_section(voice_text, r"Problems\s*I[\'’]m solving", r".+")
+    meeting_problems = parse_items_from_section(meeting_text, r"Problems\s*I[\'’]m solving", r".+")
+    if voice_themes or meeting_themes or voice_problems or meeting_problems:
+        return True
+
+    if digest_path.exists():
+        digest_text = digest_path.read_text()
+        for pattern in [r"What I noticed \(in conversation\)", r"What I noticed[^—\n(]*"]:
+            if extract_section(digest_text, pattern):
+                return True
+    return False
+
+
 def assemble_week_markdown(label: str) -> str:
     """Build a clean unified weekly view.
 
@@ -229,6 +259,10 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<!-- Local-only viewer; never want a stale cache after a rebuild -->
+<meta http-equiv="Cache-Control" content="no-store, no-cache, must-revalidate">
+<meta http-equiv="Pragma" content="no-cache">
+<meta http-equiv="Expires" content="0">
 <title>Wispr Thoughts</title>
 <link rel="icon" type="image/png" href="favicon.png">
 <link rel="apple-touch-icon" href="apple-touch-icon.png">
@@ -308,8 +342,8 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   .nav-btn:disabled { opacity: 0.25; cursor: not-allowed; }
   .date-range { padding: 0 4px; }
 
-  /* Command palette */
-  body.palette-open { overflow: hidden; }
+  /* Command palette + settings modal share this body lock */
+  body.palette-open { overflow: hidden; overscroll-behavior: none; }
   .palette-overlay {
     position: fixed; inset: 0; z-index: 100; display: none;
     background: rgba(0,0,0,0.45); backdrop-filter: blur(4px);
@@ -395,7 +429,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   details { margin: 8px 0; }
   summary { cursor: pointer; color: var(--muted); font-size: 0.9em; }
   .empty { color: var(--muted); font-style: italic; padding: 40px 0; text-align: center; }
-  /* Sync modal (sync pill click) */
+  /* Settings modal (sync pill click) */
   .sync-overlay {
     position: fixed; inset: 0; z-index: 110; display: none;
     background: rgba(0,0,0,0.45); backdrop-filter: blur(4px);
@@ -403,39 +437,154 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   }
   .sync-overlay.open {
     display: flex; align-items: flex-start; justify-content: center;
-    padding: 12vh 16px; overflow-y: auto;
+    padding: 6vh 16px; overflow-y: auto;
   }
   .sync-modal {
-    width: 100%; max-width: 560px; background: var(--bg);
+    width: 100%; max-width: 600px; background: var(--bg);
     border: 1px solid var(--border); border-radius: 14px;
     box-shadow: var(--shadow); padding: 22px 24px 18px;
   }
   .sync-header {
     display: flex; align-items: baseline; justify-content: space-between;
-    gap: 12px; margin-bottom: 12px;
+    gap: 12px; margin-bottom: 4px;
   }
   .sync-header h2 {
     font-family: ui-serif, "New York", Charter, Cambria, Georgia, serif;
-    font-weight: 500; font-size: 24px; letter-spacing: -0.01em;
+    font-weight: 500; font-size: 26px; letter-spacing: -0.01em;
     margin: 0; line-height: 1.15;
   }
-  .sync-intro {
-    color: var(--muted); margin: 0 0 16px; font-size: 14px; line-height: 1.55;
+  .sync-subtitle {
+    color: var(--muted); margin: 0 0 16px; font-size: 13px;
   }
+  .settings-card {
+    border: 1px solid var(--border); border-radius: 12px;
+    padding: 14px 16px; margin: 0 0 12px;
+    background: var(--bg);
+  }
+  .settings-card h3 {
+    margin: 0 0 4px; font-size: 13px; font-weight: 600;
+    text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted);
+    border: none; padding: 0;
+  }
+  .settings-row {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    align-items: center; column-gap: 14px; margin: 10px 0;
+  }
+  .settings-row.input {
+    grid-template-columns: minmax(0, 1fr) minmax(220px, auto);
+  }
+  .settings-row .label-text {
+    font-size: 14px; color: var(--fg);
+  }
+  .settings-row .label-sub {
+    color: var(--muted); font-size: 12px; margin-top: 2px; line-height: 1.4;
+  }
+  .settings-row .label-sub a {
+    color: var(--accent); text-decoration: none;
+  }
+  .settings-row .label-sub a:hover { text-decoration: underline; }
+  .settings-row .control {
+    justify-self: end; display: flex; align-items: center; gap: 8px; min-width: 0;
+  }
+  .settings-row input[type="text"],
+  .settings-row input[type="email"],
+  .settings-row input[type="password"],
+  .settings-row select {
+    background: var(--code-bg); color: var(--fg);
+    border: 1px solid var(--border); border-radius: 8px;
+    padding: 7px 10px; font-size: 13px; font-family: inherit;
+    width: 100%; max-width: 100%; outline: none;
+    min-width: 0;
+  }
+  .settings-row .control select { width: auto; min-width: 110px; }
+  .settings-row input:focus,
+  .settings-row select:focus {
+    border-color: var(--accent);
+  }
+  /* iOS-style toggle */
+  .toggle {
+    position: relative; display: inline-block;
+    width: 38px; height: 22px; flex-shrink: 0;
+  }
+  .toggle input { opacity: 0; width: 0; height: 0; }
+  .toggle .slider {
+    position: absolute; cursor: pointer; inset: 0;
+    background-color: var(--border); border-radius: 999px;
+    transition: 0.18s;
+  }
+  .toggle .slider::before {
+    position: absolute; content: "";
+    height: 16px; width: 16px; left: 3px; bottom: 3px;
+    background-color: white; border-radius: 999px;
+    transition: 0.18s;
+    box-shadow: 0 1px 2px rgba(0,0,0,0.3);
+  }
+  .toggle input:checked + .slider { background-color: var(--accent); }
+  .toggle input:checked + .slider::before { transform: translateX(16px); }
+  .toggle input:disabled + .slider { opacity: 0.5; cursor: not-allowed; }
+
+  .source-row {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto auto;
+    align-items: center; column-gap: 12px; margin: 8px 0; font-size: 13px;
+  }
+  .source-row .src-name {
+    color: var(--fg); display: flex; flex-direction: column; min-width: 0;
+  }
+  .source-row .src-name .src-hint {
+    color: var(--muted); font-size: 11px; margin-top: 2px;
+  }
+  .source-row .src-status {
+    font-size: 11px; padding: 2px 8px; border-radius: 999px;
+    text-transform: uppercase; letter-spacing: 0.05em;
+    font-weight: 600; white-space: nowrap;
+  }
+  .source-extra {
+    grid-column: 1 / -1; padding-top: 6px;
+    display: flex; gap: 8px; align-items: center;
+  }
+  .source-extra input[type="text"] {
+    flex: 1; background: var(--code-bg); color: var(--fg);
+    border: 1px solid var(--border); border-radius: 8px;
+    padding: 6px 10px; font-size: 12px;
+    font-family: ui-monospace, "SF Mono", monospace;
+    outline: none;
+  }
+  .source-extra input:focus { border-color: var(--accent); }
+  .src-status.detected {
+    background: rgba(34,197,94,0.14); color: rgb(22,163,74);
+    border: 1px solid rgba(34,197,94,0.3);
+  }
+  .src-status.missing {
+    background: rgba(107,107,107,0.14); color: var(--muted);
+    border: 1px solid var(--border);
+  }
+  .src-status.disabled {
+    background: transparent; color: var(--muted);
+    border: 1px dashed var(--border);
+  }
+  @media (prefers-color-scheme: dark) {
+    .src-status.detected { color: rgb(74,222,128); }
+  }
+
   .sync-log {
     background: var(--code-bg); border: 1px solid var(--border);
-    border-radius: 10px; padding: 12px 14px; margin: 0 0 16px;
+    border-radius: 10px; padding: 12px 14px; margin: 0 0 14px;
     font-family: ui-monospace, "SF Mono", monospace; font-size: 12px;
     line-height: 1.55; color: var(--fg);
-    max-height: 50vh; overflow-y: auto;
+    max-height: 38vh; overflow-y: auto;
     white-space: pre-wrap; word-wrap: break-word;
   }
   .sync-actions {
-    display: flex; justify-content: flex-end; gap: 10px;
+    display: flex; justify-content: space-between; align-items: center;
+    gap: 10px; margin-top: 4px;
   }
+  .sync-actions .left { color: var(--muted); font-size: 12px; }
+  .sync-actions .right { display: flex; gap: 10px; }
   .sync-btn {
     border: 1px solid var(--border); border-radius: 8px;
-    padding: 8px 16px; font-size: 14px; cursor: pointer;
+    padding: 8px 16px; font-size: 13px; cursor: pointer;
     font-family: inherit; transition: background 0.1s, border-color 0.1s, color 0.1s;
   }
   .sync-btn:disabled { cursor: not-allowed; opacity: 0.5; }
@@ -445,6 +594,14 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     background: var(--accent); border-color: var(--accent); color: white;
   }
   .sync-btn-primary:hover:not(:disabled) { filter: brightness(1.05); }
+  .test-result {
+    font-size: 12px; margin-top: 8px;
+  }
+  .test-result.ok { color: rgb(22,163,74); }
+  .test-result.err { color: rgb(220,38,38); }
+  @media (prefers-color-scheme: dark) {
+    .test-result.ok { color: rgb(74,222,128); }
+  }
 
   /* Prompts modal (P key, footer link, click outside to close) */
   .prompts-overlay {
@@ -556,22 +713,59 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 <main id="content"></main>
 
 <div class="sync-overlay" id="syncOverlay">
-  <div class="sync-modal" role="dialog" aria-label="Sync your data">
+  <div class="sync-modal" role="dialog" aria-label="Settings">
     <div class="sync-header">
-      <h2 id="syncModalTitle">Sync now</h2>
+      <h2 id="syncModalTitle">Settings</h2>
       <button class="prompts-close" id="syncClose" aria-label="Close">×</button>
     </div>
+    <p class="sync-subtitle" id="syncSubtitle">Auto-sync schedule and source detection.</p>
+
     <div class="sync-body" id="syncBody">
-      <p class="sync-intro" id="syncIntro">
-        Re-pulls your enabled sources (Wispr Flow, Fathom, Granola), re-themes
-        the most recent completed week, and rebuilds the viewer. Roughly two
-        minutes. The viewer will reload when it finishes.
-      </p>
+
+      <div class="settings-card">
+        <h3>Auto-sync</h3>
+        <div class="settings-row">
+          <div class="label-text">Run weekly automatically</div>
+          <div class="control">
+            <label class="toggle">
+              <input type="checkbox" id="autoSyncToggle">
+              <span class="slider"></span>
+            </label>
+          </div>
+        </div>
+        <div class="settings-row">
+          <div class="label-text">Schedule</div>
+          <div class="control" style="color: var(--muted); font-size: 13px;">
+            Sundays at 8:00 AM
+          </div>
+        </div>
+        <!-- Always visible. Two states: caught up vs N weeks pending. -->
+        <div class="settings-row" id="backfillRow">
+          <div>
+            <div class="label-text" id="backfillTitle">Past weeks</div>
+            <div class="label-sub" id="backfillCountLabel">Checking…</div>
+          </div>
+          <div class="control">
+            <button class="sync-btn sync-btn-secondary" id="backfillStart" disabled>Checking…</button>
+          </div>
+        </div>
+      </div>
+
+      <div class="settings-card">
+        <h3>Sources</h3>
+        <div id="sourcesList"></div>
+      </div>
+
       <pre class="sync-log" id="syncLog" hidden></pre>
     </div>
+
     <div class="sync-actions" id="syncActions">
-      <button class="sync-btn sync-btn-secondary" id="syncCancel">Cancel</button>
-      <button class="sync-btn sync-btn-primary" id="syncStart">Sync now</button>
+      <div class="left" id="settingsSavedHint"></div>
+      <div class="right">
+        <button class="sync-btn sync-btn-secondary" id="syncCancel">Close</button>
+        <!-- Hidden by default. Only appears mid-sync (Stop sync) or just-after (Reload viewer). -->
+        <button class="sync-btn sync-btn-primary" id="syncStart" hidden>Sync now</button>
+      </div>
     </div>
   </div>
 </div>
@@ -670,7 +864,24 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 
 <script>
   const WEEKS = __WEEKS_JSON__;
-  let idx = WEEKS.length - 1;
+
+  // Default to the most recently *completed* week (Saturday in the past), not
+  // the in-progress current week. Today's date in local YYYY-MM-DD so the
+  // comparison matches the week's Saturday ISO date.
+  function todayISOLocal() {
+    const d = new Date();
+    const y = d.getFullYear(), m = String(d.getMonth() + 1).padStart(2, '0');
+    const day = String(d.getDate()).padStart(2, '0');
+    return `${y}-${m}-${day}`;
+  }
+  function defaultWeekIdx() {
+    const today = todayISOLocal();
+    for (let i = WEEKS.length - 1; i >= 0; i--) {
+      if (WEEKS[i].sat && WEEKS[i].sat < today) return i;
+    }
+    return WEEKS.length - 1;
+  }
+  let idx = defaultWeekIdx();
 
   // Allow inline HTML (source pills) inside parsed markdown
   marked.use({ gfm: true, breaks: false, mangle: false });
@@ -777,13 +988,115 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     if (e.target === overlayEl) closePalette();
   });
 
-  // ---------- Sync pill (polls /api/status, click → sync modal) ----------
+  // ---------- Backfill row (lives inside the Auto-sync card) ----------
+  const backfillRowEl    = document.getElementById('backfillRow');
+  const backfillTitleEl  = document.getElementById('backfillTitle');
+  const backfillCountEl  = document.getElementById('backfillCountLabel');
+  const backfillStartEl  = document.getElementById('backfillStart');
+  let LAST_BACKFILL_COUNT = null;
+
+  function setBackfillCaughtUp() {
+    backfillTitleEl.textContent  = 'Past weeks';
+    backfillCountEl.textContent  = 'All themes are up to date.';
+    backfillStartEl.textContent  = 'Caught up';
+    backfillStartEl.disabled     = true;
+  }
+  function setBackfillPending(count) {
+    backfillTitleEl.textContent = count === 1
+      ? '1 past week needs theming'
+      : `${count} past weeks need theming`;
+    backfillCountEl.textContent =
+      'Re-run themes for weeks captured before auto-sync started.';
+    backfillStartEl.textContent = `Backfill ${count}`;
+    backfillStartEl.disabled    = false;
+  }
+  function setBackfillError(msg) {
+    backfillTitleEl.textContent = 'Past weeks';
+    backfillCountEl.textContent = msg;
+    backfillStartEl.textContent = 'Retry';
+    backfillStartEl.disabled    = false;
+  }
+
+  async function refreshBackfillRow() {
+    if (!HAS_API) {
+      setBackfillError('Server offline. Start it: python3 src/serve.py');
+      return;
+    }
+    try {
+      const r = await fetch('/api/backfill', { cache: 'no-store' });
+      if (!r.ok) {
+        setBackfillError(`Couldn't check: HTTP ${r.status}`);
+        return;
+      }
+      const data = await r.json();
+      const count = data.unthemed_count || 0;
+      LAST_BACKFILL_COUNT = count;
+      if (count === 0) setBackfillCaughtUp();
+      else             setBackfillPending(count);
+    } catch (e) {
+      setBackfillError(`Couldn't check: ${e}`);
+    }
+  }
+
+  backfillStartEl.addEventListener('click', async () => {
+    // If we already know the count is 0, just re-check and exit — no point
+    // hitting the POST endpoint when nothing's pending.
+    if (LAST_BACKFILL_COUNT === 0) {
+      await refreshBackfillRow();
+      return;
+    }
+    const originalLabel = backfillStartEl.textContent;
+    backfillStartEl.disabled = true;
+    backfillStartEl.textContent = 'Starting…';
+    try {
+      const r = await fetch('/api/backfill', { method: 'POST' });
+      if (r.status === 409) {
+        backfillCountEl.textContent = 'A sync is already running. Try again when it finishes.';
+        backfillStartEl.disabled = false;
+        backfillStartEl.textContent = originalLabel;
+        return;
+      }
+      const data = await r.json().catch(() => ({}));
+      if (!r.ok) {
+        backfillCountEl.textContent = `Failed: ${data.error || r.status}`;
+        backfillStartEl.disabled = false;
+        backfillStartEl.textContent = originalLabel;
+        return;
+      }
+      // Nothing-to-do response: refresh state and bail out
+      if (!data.job_id) {
+        await refreshBackfillRow();
+        return;
+      }
+      // Real job started — switch the modal into log-streamer mode
+      syncTitleEl.textContent = 'Backfilling…';
+      syncSubtitleEl.hidden = true;
+      syncStartEl.hidden = false;
+      syncStartEl.disabled = false;
+      syncStartEl.textContent = 'Stop sync';
+      syncLogEl.hidden = false;
+      syncLogEl.textContent = `Backfilling ${data.weeks ? data.weeks.length : '…'} weeks…\n`;
+      if (syncPollHandle) clearInterval(syncPollHandle);
+      syncPollHandle = setInterval(pollSyncLog, 1000);
+      pollSyncLog();
+    } catch (e) {
+      backfillCountEl.textContent = `Failed: ${e}`;
+      backfillStartEl.disabled = false;
+      backfillStartEl.textContent = originalLabel;
+    }
+  });
+
+  // ---------- Sync pill (polls /api/status, click → settings modal) ----------
   const syncPillEl  = document.getElementById('syncPill');
   const syncDotEl   = document.getElementById('syncDot');
   const syncLabelEl = document.getElementById('syncLabel');
 
-  // file:// origins can't talk to localhost API; the pill shows "Server offline"
+  // file:// origins can't talk to localhost API; pill still opens, but only
+  // shows a "start the server" hint
   const HAS_API = window.location.protocol === 'http:' || window.location.protocol === 'https:';
+
+  let LAST_STATUS  = null;
+  let LAST_SCHEDULE = null;
 
   function setSyncPill(state, label) {
     syncPillEl.classList.remove('fresh', 'stale', 'very-stale', 'offline', 'syncing');
@@ -791,75 +1104,269 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     syncLabelEl.textContent = label;
   }
 
-  function relativeTime(iso) {
-    if (!iso) return 'never synced';
-    const then = new Date(iso).getTime();
-    const ageMin = Math.floor((Date.now() - then) / 60000);
-    if (ageMin < 1)   return 'just synced';
-    if (ageMin < 60)  return `synced ${ageMin}m ago`;
-    const ageHr = Math.floor(ageMin / 60);
-    if (ageHr < 24)   return `synced ${ageHr}h ago`;
-    const ageDay = Math.floor(ageHr / 24);
-    return `synced ${ageDay}d ago`;
+  function pillLabelFromState(status, schedule) {
+    if (!status) return 'Click to set up';
+    if (status.syncing) return 'Syncing…';
+    if (status.freshness === 'never' && (!status.last_sync)) return 'Click to set up';
+    return 'synced';
+  }
+
+  function pillStateFromStatus(status, schedule) {
+    if (!status) return 'offline';
+    if (status.syncing) return 'syncing';
+    return status.freshness;
   }
 
   async function refreshStatus() {
     if (!HAS_API) {
-      setSyncPill('offline', 'Server offline');
-      syncPillEl.disabled = true;
+      setSyncPill('offline', 'Click to set up');
+      // Pill stays clickable; the modal explains how to start the server.
+      syncPillEl.disabled = false;
       return;
     }
     try {
-      const r = await fetch('/api/status', { cache: 'no-store' });
-      if (!r.ok) throw new Error('status ' + r.status);
-      const s = await r.json();
-      if (s.syncing) {
-        setSyncPill('syncing', 'Syncing…');
-        syncPillEl.disabled = true;
-        return;
-      }
+      const [sRes, schRes] = await Promise.all([
+        fetch('/api/status',   { cache: 'no-store' }),
+        fetch('/api/schedule', { cache: 'no-store' }),
+      ]);
+      LAST_STATUS  = sRes.ok ? await sRes.json() : null;
+      LAST_SCHEDULE = schRes.ok ? await schRes.json() : null;
+      // Pill stays clickable even while syncing — opens the settings drawer
+      // so the user can still toggle auto-sync, paste API keys, etc. The
+      // "Sync now" button inside the drawer is what gates concurrent runs.
       syncPillEl.disabled = false;
-      const labels = {
-        fresh:        relativeTime(s.last_sync),
-        stale:        'Ready for update',
-        'very-stale': 'Stale, sync now',
-        never:        'Never synced',
-      };
-      setSyncPill(s.freshness, labels[s.freshness] || relativeTime(s.last_sync));
+      setSyncPill(
+        pillStateFromStatus(LAST_STATUS, LAST_SCHEDULE),
+        pillLabelFromState(LAST_STATUS, LAST_SCHEDULE),
+      );
     } catch (e) {
-      setSyncPill('offline', 'Server offline');
-      syncPillEl.disabled = true;
+      LAST_STATUS = null; LAST_SCHEDULE = null;
+      setSyncPill('offline', 'Click to set up');
+      syncPillEl.disabled = false;
     }
   }
   refreshStatus();
   setInterval(refreshStatus, 30000);
 
-  // ---------- Sync modal ----------
-  const syncOverlayEl = document.getElementById('syncOverlay');
-  const syncCloseEl   = document.getElementById('syncClose');
-  const syncCancelEl  = document.getElementById('syncCancel');
-  const syncStartEl   = document.getElementById('syncStart');
-  const syncIntroEl   = document.getElementById('syncIntro');
-  const syncLogEl     = document.getElementById('syncLog');
-  const syncTitleEl   = document.getElementById('syncModalTitle');
+  // ---------- Settings modal ----------
+  const syncOverlayEl   = document.getElementById('syncOverlay');
+  const syncCloseEl     = document.getElementById('syncClose');
+  const syncCancelEl    = document.getElementById('syncCancel');
+  const syncStartEl     = document.getElementById('syncStart');
+  const syncSubtitleEl  = document.getElementById('syncSubtitle');
+  const syncLogEl       = document.getElementById('syncLog');
+  const syncTitleEl     = document.getElementById('syncModalTitle');
+  const settingsSavedEl = document.getElementById('settingsSavedHint');
+
+  const autoSyncToggleEl = document.getElementById('autoSyncToggle');
+  // Schedule is fixed at Sunday 8:00 AM. No selectors; the constants below
+  // are what every install/remove call uses.
+  const FIXED_WEEKDAY = 0;
+  const FIXED_HOUR    = 8;
+  const FIXED_MINUTE  = 0;
+
+  const sourcesListEl = document.getElementById('sourcesList');
 
   let syncOpen = false;
   let syncPollHandle = null;
+  let settingsLoaded = false;
+  let savedHintTimer = null;
+
+  function showSavedHint(text) {
+    if (savedHintTimer) clearTimeout(savedHintTimer);
+    settingsSavedEl.textContent = text;
+    savedHintTimer = setTimeout(() => { settingsSavedEl.textContent = ''; }, 2200);
+  }
+
+
+  async function loadSettings() {
+    try {
+      const [setRes, schRes] = await Promise.all([
+        fetch('/api/settings',  { cache: 'no-store' }),
+        fetch('/api/schedule', { cache: 'no-store' }),
+      ]);
+      if (!setRes.ok || !schRes.ok) throw new Error('settings load failed');
+      const settings = await setRes.json();
+      const schedule = await schRes.json();
+
+      autoSyncToggleEl.checked = !!schedule.installed;
+
+
+      // Sources
+      sourcesListEl.innerHTML = '';
+      const SRC_LABELS = {
+        wispr:   'Wispr Flow (voice dictation)',
+        fathom:  'Fathom (meeting transcripts)',
+        granola: 'Granola (meeting cache)',
+        notes:   'Apple Notes (parallel corpus)',
+      };
+      Object.entries(settings.sources || {}).forEach(([name, info]) => {
+        const row = document.createElement('div');
+        row.className = 'source-row';
+
+        const nameEl = document.createElement('div');
+        nameEl.className = 'src-name';
+        const title = document.createElement('div');
+        title.textContent = SRC_LABELS[name] || name;
+        nameEl.appendChild(title);
+        if (info.hint) {
+          const hint = document.createElement('div');
+          hint.className = 'src-hint';
+          hint.textContent = info.hint;
+          nameEl.appendChild(hint);
+        }
+        row.appendChild(nameEl);
+
+        const tag = document.createElement('span');
+        tag.className = 'src-status ' + (info.enabled ? (info.detected ? 'detected' : 'missing') : 'disabled');
+        tag.textContent = info.enabled
+          ? (info.detected ? 'Detected' : 'Set up')
+          : 'Disabled';
+        row.appendChild(tag);
+
+        const toggleLabel = document.createElement('label');
+        toggleLabel.className = 'toggle';
+        const toggleInput = document.createElement('input');
+        toggleInput.type = 'checkbox';
+        toggleInput.checked = !!info.enabled;
+        toggleInput.addEventListener('change', () => saveSourceFromUI(name, toggleInput.checked));
+        const slider = document.createElement('span');
+        slider.className = 'slider';
+        toggleLabel.appendChild(toggleInput); toggleLabel.appendChild(slider);
+        row.appendChild(toggleLabel);
+
+        // Fathom: inline API key input when enabled but no key found
+        if (name === 'fathom' && info.enabled && !info.detected) {
+          const extra = document.createElement('div');
+          extra.className = 'source-extra';
+          const inp = document.createElement('input');
+          inp.type = 'text';
+          inp.placeholder = 'Paste your Fathom API key';
+          inp.spellcheck = false;
+          inp.autocomplete = 'off';
+          const btn = document.createElement('button');
+          btn.className = 'sync-btn sync-btn-secondary';
+          btn.textContent = 'Save';
+          btn.addEventListener('click', async () => {
+            const key = inp.value.trim();
+            if (!key) return;
+            btn.disabled = true; btn.textContent = 'Saving…';
+            try {
+              const r = await fetch('/api/settings', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({ fathom_api_key: key }),
+              });
+              if (r.ok) {
+                showSavedHint('Fathom key saved to ~/.zshrc.');
+                loadSettings();
+              } else {
+                const data = await r.json().catch(() => ({}));
+                showSavedHint(`Save failed: ${data.error || r.status}`);
+                btn.disabled = false; btn.textContent = 'Save';
+              }
+            } catch (e) {
+              showSavedHint(`Save failed: ${e}`);
+              btn.disabled = false; btn.textContent = 'Save';
+            }
+          });
+          extra.appendChild(inp); extra.appendChild(btn);
+          row.appendChild(extra);
+        }
+
+        sourcesListEl.appendChild(row);
+      });
+
+      settingsLoaded = true;
+    } catch (e) {
+      console.error('settings load error', e);
+      settingsLoaded = false;
+    }
+  }
+
+  async function saveSourceFromUI(name, enabled) {
+    try {
+      const r = await fetch('/api/settings', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({ sources: { [name]: { enabled } } }),
+      });
+      if (!r.ok) {
+        const data = await r.json().catch(() => ({}));
+        showSavedHint(`Save failed: ${data.error || r.status}`);
+        return;
+      }
+      showSavedHint(`${name} ${enabled ? 'enabled' : 'disabled'}.`);
+      loadSettings();
+    } catch (e) {
+      showSavedHint(`Save failed: ${e}`);
+    }
+  }
+
+  async function saveScheduleFromUI() {
+    if (!settingsLoaded) return;
+    const enabled = autoSyncToggleEl.checked;
+    try {
+      const r = await fetch('/api/schedule', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({
+          enabled,
+          weekday: FIXED_WEEKDAY,
+          hour:    FIXED_HOUR,
+          minute:  FIXED_MINUTE,
+        }),
+      });
+      if (!r.ok) {
+        const data = await r.json().catch(() => ({}));
+        showSavedHint(`Schedule failed: ${data.error || r.status}`);
+        return;
+      }
+      showSavedHint(enabled ? 'Auto-sync enabled.' : 'Auto-sync disabled.');
+      refreshStatus();
+    } catch (e) {
+      showSavedHint(`Schedule failed: ${e}`);
+    }
+  }
+
+  // Wire change handler for the auto-sync toggle. Schedule is fixed at
+  // Sunday 8 AM, so there are no other inputs to listen on.
+  autoSyncToggleEl.addEventListener('change', saveScheduleFromUI);
 
   function openSyncModal() {
     syncOpen = true;
-    // Reset to the confirm view
-    syncTitleEl.textContent = 'Sync now';
-    syncIntroEl.hidden = false;
+    document.body.classList.add('palette-open');
+    syncTitleEl.textContent = 'Settings';
+    syncSubtitleEl.hidden = false;
     syncLogEl.hidden = true;
     syncLogEl.textContent = '';
+    syncStartEl.hidden = true;
     syncStartEl.disabled = false;
-    syncStartEl.textContent = 'Sync now';
-    syncCancelEl.textContent = 'Cancel';
+    syncCancelEl.textContent = 'Close';
+    settingsSavedEl.textContent = '';
     syncOverlayEl.classList.add('open');
+    if (HAS_API) {
+      loadSettings();
+      refreshBackfillRow();
+      // If a sync is already in flight (e.g., launchd just fired), attach
+      // to it so the user can watch + stop it.
+      if (LAST_STATUS && LAST_STATUS.syncing) {
+        syncTitleEl.textContent = 'Syncing…';
+        syncStartEl.hidden = false;
+        syncStartEl.disabled = false;
+        syncStartEl.textContent = 'Stop sync';
+        syncCancelEl.textContent = 'Hide';
+        syncLogEl.hidden = false;
+        syncLogEl.textContent = 'Tailing in-progress sync…\n';
+        if (syncPollHandle) clearInterval(syncPollHandle);
+        syncPollHandle = setInterval(pollSyncLog, 1000);
+        pollSyncLog();
+      }
+    }
   }
   function closeSyncModal() {
     syncOpen = false;
+    document.body.classList.remove('palette-open');
     if (syncPollHandle) { clearInterval(syncPollHandle); syncPollHandle = null; }
     syncOverlayEl.classList.remove('open');
   }
@@ -871,10 +1378,11 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 
   async function startSync() {
     syncTitleEl.textContent = 'Syncing…';
-    syncIntroEl.hidden = true;
     syncLogEl.hidden = false;
     syncLogEl.textContent = 'Starting sync…\n';
     syncStartEl.disabled = true;
+    syncStartEl.textContent = 'Stop sync';
+    syncStartEl.disabled = false;
     syncCancelEl.textContent = 'Hide';
 
     try {
@@ -908,34 +1416,68 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       }
       if (data.finished) {
         clearInterval(syncPollHandle); syncPollHandle = null;
+        // Idle = no job ever ran; don't surface that as "failed". Quietly
+        // reset the modal back to the settings view.
+        if (data.status === 'idle') {
+          syncTitleEl.textContent = 'Settings';
+          syncSubtitleEl.hidden = false;
+          syncLogEl.hidden = true;
+          syncStartEl.hidden = true;
+          syncCancelEl.textContent = 'Close';
+          refreshStatus();
+          return;
+        }
         const ok = data.status === 'completed';
-        syncTitleEl.textContent = ok ? 'Sync complete' : 'Sync failed';
-        syncStartEl.disabled = false;
-        syncStartEl.textContent = 'Reload viewer';
+        const cancelled = data.status === 'cancelled';
+        syncTitleEl.textContent = ok ? 'Sync complete' : (cancelled ? 'Sync stopped' : 'Sync failed');
+        if (ok) {
+          syncStartEl.hidden = false;
+          syncStartEl.disabled = false;
+          syncStartEl.textContent = 'Reload viewer';
+        } else {
+          syncStartEl.hidden = true;
+        }
         syncCancelEl.textContent = 'Close';
         if (ok) {
-          // Reload after a short pause so the user sees the success state
           setTimeout(() => { window.location.reload(); }, 1200);
         }
         refreshStatus();
       }
     } catch (e) {
-      // Server might have restarted mid-sync; surface but keep polling
       syncLogEl.textContent += `\nPoll error: ${e}\n`;
     }
   }
 
-  syncStartEl.addEventListener('click', () => {
-    if (syncStartEl.textContent === 'Reload viewer') {
+  syncStartEl.addEventListener('click', async () => {
+    const label = syncStartEl.textContent;
+    if (label === 'Reload viewer') {
       window.location.reload();
+      return;
+    }
+    if (label === 'Stop sync') {
+      syncStartEl.disabled = true;
+      syncStartEl.textContent = 'Stopping…';
+      try {
+        await fetch('/api/sync/cancel', { method: 'POST' });
+      } catch (e) {
+        syncLogEl.textContent += `\nCancel error: ${e}\n`;
+      }
+      // Polling will pick up the cancelled state and reset the button.
+      return;
+    }
+    if (!HAS_API) {
+      // file:// origin: tell the user to start the server
+      syncLogEl.hidden = false;
+      syncLogEl.textContent =
+        'Start the server, then re-open this page from http://127.0.0.1:8080/:\n\n' +
+        '  python3 src/serve.py\n';
       return;
     }
     startSync();
   });
 
-  // Pill click opens the modal
   syncPillEl.addEventListener('click', () => {
-    if (!HAS_API || syncPillEl.disabled) return;
+    if (syncPillEl.disabled) return;
     openSyncModal();
   });
 
@@ -980,7 +1522,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     if (promptsOpen) return;
     if (e.key === 'ArrowLeft'  && idx > 0)                  { idx--; render(); }
     if (e.key === 'ArrowRight' && idx < WEEKS.length - 1)   { idx++; render(); }
-    if (e.key === 't' || e.key === 'T')                     { idx = WEEKS.length - 1; render(); }
+    if (e.key === 't' || e.key === 'T')                     { idx = defaultWeekIdx(); render(); }
   });
 
   render();
@@ -1018,11 +1560,20 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 
 
 def main() -> None:
-    labels = discover_weeks()
+    all_labels = discover_weeks()
+    # Hide weeks whose theming pass hasn't run yet — captured-but-not-themed
+    # placeholder files exist for the in-progress week as soon as Wispr export
+    # runs, but the user only "unlocks" a week by accumulating dictation /
+    # meetings AND running theme extraction. The viewer should mirror that.
+    labels = [w for w in all_labels if has_themed_content(w)]
     if not labels:
-        sys.exit("No weeks found in data/weeks, data/master/50_weeks, or data/digests.")
-
-    print(f"Building viewer for {len(labels)} weeks: {labels[0]} → {labels[-1]}")
+        sys.exit(
+            "No themed weeks yet. Run `python3 src/weekly_email.py` to build the "
+            "first one, or `./demo.sh` for a synthetic preview."
+        )
+    skipped = len(all_labels) - len(labels)
+    skipped_note = f" (skipped {skipped} not-yet-themed)" if skipped else ""
+    print(f"Building viewer for {len(labels)} weeks: {labels[0]} → {labels[-1]}{skipped_note}")
 
     weeks_data = []
     for label in labels:
@@ -1043,6 +1594,7 @@ def main() -> None:
             "label": label,
             "range": range_str,
             "search": search_hints,
+            "sat": sat.isoformat(),  # Saturday end-date for "completed" check
             "markdown": assemble_week_markdown(label),
         })
 

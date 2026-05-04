@@ -10,6 +10,13 @@ and exposes a JSON API for the sync pill in the viewer:
     POST /api/sync          -> { job_id } or 409 if already running
     GET  /api/sync/log      -> { job_id, status, lines, finished } for the most
                                 recent job; viewer polls every 1s during a run
+    GET  /api/settings      -> { email, schedule, sources, paths }
+    POST /api/settings      -> { ok } applies a partial settings dict
+    POST /api/settings/email/test -> { ok, error? } sends a test email
+    GET  /api/schedule      -> { installed, weekday, hour, minute, next_run, ... }
+    POST /api/schedule      -> { ok } installs/removes the launchd job
+    GET  /api/backfill      -> { unthemed_count, weeks: list[str] }
+    POST /api/backfill      -> { job_id } runs themes for every unthemed week
 
 Bound to 127.0.0.1 only. Never reachable from outside the laptop. No auth on
 purpose; the network bind is the access boundary.
@@ -40,9 +47,39 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse
 
+import _schedule
+import _settings
 from _config import load as load_config, resolve_path
 
 CFG = load_config()
+
+
+def _hydrate_env_from_zshrc() -> None:
+    """Pull `export FOO_API_KEY=...` lines from ~/.zshrc into our env on boot.
+
+    serve.py launches as a child of whatever shell ran it, so it may or may
+    not have the user's API keys depending on how the shell was invoked. The
+    cron-side launchd job sources .zshrc via `zsh -lc`; we mirror that here
+    so manually-triggered /api/sync runs see the same env.
+
+    Only loads keys we don't already have. Whitelisted to *_API_KEY shapes so
+    we don't leak unrelated env. Ignores quotes around the value.
+    """
+    import re as _re
+    zshrc = Path.home() / ".zshrc"
+    if not zshrc.exists():
+        return
+    pat = _re.compile(r"^\s*export\s+([A-Z][A-Z0-9_]*_API_KEY)\s*=\s*['\"]?(.+?)['\"]?\s*$")
+    try:
+        for line in zshrc.read_text().splitlines():
+            m = pat.match(line)
+            if m and m.group(1) not in os.environ:
+                os.environ[m.group(1)] = m.group(2)
+    except OSError:
+        pass
+
+
+_hydrate_env_from_zshrc()
 ROOT = Path(__file__).resolve().parent.parent
 VIEWER_DIR = ROOT / "data" / "viewer"
 LOGS_DIR = resolve_path(CFG, "logs_dir")
@@ -87,13 +124,19 @@ def _start_sync_thread(job: dict) -> None:
             fh.write(f"# job {job['id']} started {job['started_at']}\n")
             fh.write(f"# command: {' '.join(cmd)}\n\n")
             fh.flush()
+            # start_new_session=True so we get a process group; cancel can
+            # then signal the whole tree (export_wispr child, LLM subprocs).
             proc = subprocess.Popen(
                 cmd, stdout=fh, stderr=subprocess.STDOUT, cwd=ROOT, text=True,
+                start_new_session=True,
             )
+            with _JOB_LOCK:
+                job["pid"] = proc.pid
             proc.wait()
             fh.write(f"\n# job exited with code {proc.returncode}\n")
         with _JOB_LOCK:
-            job["status"] = "completed" if proc.returncode == 0 else "failed"
+            if job["status"] == "running":
+                job["status"] = "completed" if proc.returncode == 0 else "failed"
             job["finished_at"] = datetime.now(timezone.utc).isoformat()
             job["exit_code"] = proc.returncode
 
@@ -163,6 +206,207 @@ def _freshness() -> tuple[str, str | None]:
     return "very-stale", ts.isoformat()
 
 
+# --- Backfill helpers --------------------------------------------------------
+
+
+def _unthemed_completed_weeks() -> list[str]:
+    """Return labels of completed weeks that have raw data and need theming.
+
+    A week is backfillable only when at least one raw input file exists
+    (voice export `data/weeks/<W>.md` or meetings raw data). The earlier
+    looser check returned weeks discoverable via *any* artifact, including
+    old orphan files in `data/master/50_weeks/` that have no source data —
+    `build_themes.py` then aborted on every backfill attempt.
+    """
+    from datetime import date
+    import build_viewer
+    today = date.today()
+    weeks_dir = resolve_path(CFG, "weeks_dir")
+    meetings_dir = resolve_path(CFG, "meetings_dir")
+    out = []
+    for label in build_viewer.discover_weeks():
+        try:
+            _, sat = build_viewer.week_range(label)
+        except ValueError:
+            continue
+        if sat >= today:
+            continue
+        if build_viewer.has_themed_content(label):
+            continue
+        # Only include if there's something to actually theme. Voice file is
+        # the canonical "this week was captured" marker; absence of meeting
+        # data alone isn't enough since themes-meetings runs over fathom +
+        # granola directories, not a per-week file.
+        voice_file = weeks_dir / f"{label}.md"
+        has_meetings = (
+            meetings_dir.is_dir()
+            and any(meetings_dir.rglob(f"*_{label[:4]}-*.md"))  # rough date match
+        )
+        if voice_file.exists() or has_meetings:
+            out.append(label)
+    return out
+
+
+def _start_backfill_thread(job: dict, weeks: list[str]) -> None:
+    """Run themes for each week sequentially, then trends, then rebuild viewer.
+
+    Skips per-week steps whose input doesn't exist instead of aborting the
+    whole batch. Only a `build_trends` or `build_viewer` failure terminates
+    the job — those run over the aggregate, so a real failure means the
+    intermediate results aren't usable.
+    """
+    weeks_dir = resolve_path(CFG, "weeks_dir")
+
+    def runner():
+        log_path = Path(job["log_path"])
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+
+        with log_path.open("w") as fh:
+            fh.write(f"# backfill job {job['id']} started {job['started_at']}\n")
+            fh.write(f"# {len(weeks)} weeks to theme: {', '.join(weeks)}\n\n")
+            fh.flush()
+            failed = False
+            successes = 0
+
+            def run_step(label: str, cmd: list[str]) -> int:
+                fh.write(f"\n=== {label} ===\n")
+                fh.flush()
+                proc = subprocess.Popen(
+                    cmd, stdout=fh, stderr=subprocess.STDOUT, cwd=ROOT, text=True,
+                    start_new_session=True,
+                )
+                with _JOB_LOCK:
+                    job["pid"] = proc.pid
+                proc.wait()
+                return proc.returncode
+
+            for w in weeks:
+                with _JOB_LOCK:
+                    if job["status"] == "cancelled":
+                        fh.write("\n# cancelled by user\n")
+                        return
+
+                voice_path = weeks_dir / f"{w}.md"
+                if voice_path.exists():
+                    rc = run_step(f"themes-voice    {w}", ["python3", "src/build_themes.py", "--week", w])
+                    if rc != 0:
+                        fh.write(f"\n# themes-voice {w} failed (exit {rc}) — continuing with next week\n")
+                    else:
+                        successes += 1
+                else:
+                    fh.write(f"\n=== themes-voice    {w} ===\n# skipped: no voice file at {voice_path}\n")
+
+                # themes-meetings is opportunistic — exits 1 when no meetings;
+                # we treat that as benign.
+                run_step(f"themes-meetings {w}", ["python3", "src/build_themes_meetings.py", "--week", w])
+
+            # Aggregate steps: only run if we actually themed something new
+            if successes > 0:
+                rc = run_step("trends", ["python3", "src/build_trends.py"])
+                if rc != 0:
+                    fh.write(f"\n# trends failed (exit {rc})\n")
+                    failed = True
+                rc = run_step("viewer", ["python3", "src/build_viewer.py"])
+                if rc != 0:
+                    fh.write(f"\n# viewer rebuild failed (exit {rc})\n")
+                    failed = True
+            else:
+                fh.write("\n# no weeks were themable; nothing to roll up\n")
+
+            fh.write(f"\n# backfill {'failed' if failed else 'complete'} ({successes} weeks newly themed)\n")
+
+        # Append a line to the rolling pipeline log so the pill's freshness
+        # check picks up the backfill the same way it picks up weekly syncs.
+        # Without this, the pill keeps showing "synced 6h ago" even after a
+        # 30-week backfill just landed.
+        if successes > 0 and not failed:
+            try:
+                PIPELINE_LOG.parent.mkdir(parents=True, exist_ok=True)
+                with PIPELINE_LOG.open("a") as plf:
+                    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    plf.write(f"[{ts}] === wispr-thoughts backfill: {successes} weeks themed ===\n")
+            except OSError:
+                pass
+
+        with _JOB_LOCK:
+            if job["status"] == "running":
+                job["status"] = "failed" if failed else "completed"
+            job["finished_at"] = datetime.now(timezone.utc).isoformat()
+            job["exit_code"] = 1 if failed else 0
+
+    t = threading.Thread(target=runner, daemon=True)
+    t.start()
+
+
+# --- Fathom API key persistence ---------------------------------------------
+
+
+_FATHOM_LINE_RE = None  # populated lazily
+
+
+def _persist_fathom_key(key: str) -> None:
+    """Write `export FATHOM_API_KEY='<key>'` to ~/.zshrc and the current process.
+
+    The launchd job runs the pipeline via `bash -lc`, which sources ~/.zshrc,
+    so persisting there means both manual shells and the cron pick it up
+    after the next sync.
+    """
+    import re as _re
+    zshrc = Path.home() / ".zshrc"
+    safe = key.replace("'", "'\\''")
+    new_line = f"export FATHOM_API_KEY='{safe}'"
+    pat = _re.compile(r"^\s*export\s+FATHOM_API_KEY=.*$", _re.MULTILINE)
+
+    if zshrc.exists():
+        text = zshrc.read_text()
+        if pat.search(text):
+            text = pat.sub(new_line, text)
+        else:
+            if not text.endswith("\n"):
+                text += "\n"
+            text += new_line + "\n"
+    else:
+        text = new_line + "\n"
+    zshrc.write_text(text)
+    # Make it usable for any subsequent /api/sync the user kicks off in this
+    # server process (without requiring a server restart).
+    os.environ["FATHOM_API_KEY"] = key
+
+
+# --- Source detection (read-only for the settings drawer) -------------------
+
+
+def _detect_source(name: str, source_cfg: dict) -> dict:
+    """Return {detected, hint} describing the source's reachability."""
+    if name == "wispr":
+        db = source_cfg.get("db_path", "")
+        ok = bool(db) and Path(db).exists()
+        return {"detected": ok, "hint": "" if ok else "Wispr Flow not installed"}
+    if name == "granola":
+        d = source_cfg.get("data_dir", "")
+        ok = bool(d) and Path(d).is_dir()
+        return {"detected": ok, "hint": "" if ok else "Granola not installed"}
+    if name == "fathom":
+        env_var = source_cfg.get("api_key_env", "FATHOM_API_KEY")
+        if os.environ.get(env_var, "").strip():
+            return {"detected": True, "hint": ""}
+        # Fall back to checking ~/.zshrc since the launchd job sources it via
+        # `bash -lc`. The interactive server may not have inherited the var
+        # but the cron will read it from the rc file.
+        zshrc = Path.home() / ".zshrc"
+        if zshrc.exists():
+            try:
+                if any(
+                    line.strip().startswith(f"export {env_var}=") and len(line.strip()) > len(f"export {env_var}=")
+                    for line in zshrc.read_text().splitlines()
+                ):
+                    return {"detected": True, "hint": ""}
+            except OSError:
+                pass
+        return {"detected": False, "hint": "API key needed"}
+    return {"detected": False, "hint": ""}
+
+
 # --- HTTP handler ------------------------------------------------------------
 
 
@@ -181,13 +425,44 @@ class WisprThoughtsHandler(BaseHTTPRequestHandler):
             return self._status()
         if path == "/api/sync/log":
             return self._sync_log()
+        if path == "/api/settings":
+            return self._get_settings()
+        if path == "/api/schedule":
+            return self._get_schedule()
+        if path == "/api/backfill":
+            return self._get_backfill()
         return self._serve_static(path)
 
     def do_POST(self) -> None:
         path = urlparse(self.path).path
         if path == "/api/sync":
             return self._start_sync()
+        if path == "/api/sync/cancel":
+            return self._cancel_sync()
+        if path == "/api/settings":
+            return self._post_settings()
+        if path == "/api/settings/email/test":
+            return self._post_email_test()
+        if path == "/api/schedule":
+            return self._post_schedule()
+        if path == "/api/backfill":
+            return self._start_backfill()
         self.send_error(HTTPStatus.NOT_FOUND, "Unknown POST endpoint")
+
+    # ---- Helpers for body parsing ------------------------------------------
+
+    def _read_json_body(self) -> dict | None:
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except (TypeError, ValueError):
+            length = 0
+        if length <= 0:
+            return {}
+        try:
+            raw = self.rfile.read(length).decode("utf-8")
+            return json.loads(raw)
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            return None
 
     # ---- Static file serving ------------------------------------------------
 
@@ -212,7 +487,12 @@ class WisprThoughtsHandler(BaseHTTPRequestHandler):
         self.send_response(HTTPStatus.OK)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(data)))
-        self.send_header("Cache-Control", "no-store")
+        # Aggressive no-cache for the local viewer so users never see stale
+        # HTML after the build has updated. The static asset is one file we
+        # own end-to-end; every request gets revalidated.
+        self.send_header("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
+        self.send_header("Pragma", "no-cache")
+        self.send_header("Expires", "0")
         self.end_headers()
         self.wfile.write(data)
 
@@ -260,6 +540,32 @@ class WisprThoughtsHandler(BaseHTTPRequestHandler):
         _start_sync_thread(job)
         self._json(HTTPStatus.ACCEPTED, {"job_id": job["id"], "status": job["status"]})
 
+    def _cancel_sync(self) -> None:
+        import signal
+        with _JOB_LOCK:
+            job = _CURRENT_JOB
+            if job is None or job.get("status") != "running":
+                self._json(HTTPStatus.OK, {"ok": True, "note": "no running job"})
+                return
+            pid = job.get("pid")
+            job["status"] = "cancelled"
+        if pid:
+            try:
+                # Negative pid signals the whole process group, killing the
+                # parent + any child subprocess (export_wispr, build_themes...)
+                os.killpg(pid, signal.SIGTERM)
+            except (ProcessLookupError, PermissionError):
+                pass
+        # Drop the disk lock that weekly_email.py wrote so the next manual
+        # run isn't blocked by a stale entry.
+        lock = ROOT / ".weekly-email.lock"
+        if lock.exists():
+            try:
+                lock.unlink()
+            except OSError:
+                pass
+        self._json(HTTPStatus.OK, {"ok": True})
+
     def _sync_log(self) -> None:
         with _JOB_LOCK:
             job = None if _CURRENT_JOB is None else dict(_CURRENT_JOB)
@@ -284,6 +590,220 @@ class WisprThoughtsHandler(BaseHTTPRequestHandler):
             "started_at": job["started_at"],
             "finished_at": job["finished_at"],
         })
+
+    # ---- Settings -----------------------------------------------------------
+
+    def _get_settings(self) -> None:
+        cfg = load_config()
+        email_cfg = cfg.get("email", {}) or {}
+        schedule_cfg = cfg.get("schedule", {}) or {}
+        sources_cfg = cfg.get("sources", {}) or {}
+        body = {
+            "email": {
+                "enabled": bool(email_cfg.get("enabled", False)),
+                "smtp_to": email_cfg.get("smtp_to", ""),
+                "smtp_user": email_cfg.get("smtp_user", ""),
+                "smtp_host": email_cfg.get("smtp_host", "smtp.gmail.com"),
+                "smtp_port": email_cfg.get("smtp_port", 465),
+                "keychain_service": email_cfg.get("keychain_service", "wispr-thoughts-smtp"),
+                "password_set": _settings.keychain_has(
+                    email_cfg.get("keychain_service", "wispr-thoughts-smtp"),
+                    email_cfg.get("smtp_user", ""),
+                ) if email_cfg.get("smtp_user") else False,
+            },
+            "schedule": {
+                "weekday": int(schedule_cfg.get("weekday", 0)),
+                "hour":    int(schedule_cfg.get("hour", 9)),
+                "minute":  int(schedule_cfg.get("minute", 0)),
+            },
+            # Apple Notes is exported via a separate one-shot script and never
+            # mixed into the digest pipeline, so it doesn't belong in the
+            # settings drawer's sources panel. Keep it in config for the CLI.
+            "sources": {
+                name: {
+                    "enabled": bool(s.get("enabled", False)),
+                    **_detect_source(name, s),
+                }
+                for name, s in sources_cfg.items()
+                if isinstance(s, dict) and name != "notes"
+            },
+        }
+        self._json(HTTPStatus.OK, body)
+
+    def _post_settings(self) -> None:
+        data = self._read_json_body()
+        if data is None:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid JSON"})
+            return
+
+        updates: dict[tuple[str, str], object] = {}
+        if "email" in data and isinstance(data["email"], dict):
+            e = data["email"]
+            if "enabled" in e:   updates[("email", "enabled")]   = bool(e["enabled"])
+            if "smtp_to" in e:   updates[("email", "smtp_to")]   = str(e["smtp_to"])
+            if "smtp_user" in e: updates[("email", "smtp_user")] = str(e["smtp_user"])
+            password = e.get("password")
+            if password:
+                # Best-effort write the password to the keychain. Use the
+                # current config's keychain_service + the new smtp_user.
+                cfg = load_config()
+                svc = (cfg.get("email", {}) or {}).get("keychain_service", "wispr-thoughts-smtp")
+                acct = e.get("smtp_user") or (cfg.get("email", {}) or {}).get("smtp_user", "")
+                if acct:
+                    try:
+                        _settings.keychain_set(svc, acct, password)
+                    except Exception as exc:
+                        self._json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": f"keychain: {exc}"})
+                        return
+        if "schedule" in data and isinstance(data["schedule"], dict):
+            s = data["schedule"]
+            if "weekday" in s: updates[("schedule", "weekday")] = int(s["weekday"])
+            if "hour"    in s: updates[("schedule", "hour")]    = int(s["hour"])
+            if "minute"  in s: updates[("schedule", "minute")]  = int(s["minute"])
+
+        if "sources" in data and isinstance(data["sources"], dict):
+            for name, info in data["sources"].items():
+                if not isinstance(info, dict) or "enabled" not in info:
+                    continue
+                key = (f"sources.{name}", "enabled")
+                if key in _settings.WRITABLE:
+                    updates[key] = bool(info["enabled"])
+
+        # Fathom API key is special: written to ~/.zshrc as an export line so
+        # both interactive shells and the launchd job (via `bash -lc`) inherit it.
+        fathom_key = data.get("fathom_api_key")
+        if isinstance(fathom_key, str) and fathom_key.strip():
+            try:
+                _persist_fathom_key(fathom_key.strip())
+            except Exception as exc:
+                self._json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": f"fathom key: {exc}"})
+                return
+
+        if updates:
+            try:
+                _settings.write_keys(updates)
+            except Exception as exc:
+                self._json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": f"write: {exc}"})
+                return
+
+        self._json(HTTPStatus.OK, {"ok": True})
+
+    def _post_email_test(self) -> None:
+        # Lazy import: weekly_email pulls the LLM client + every adapter, no
+        # need to load on server start.
+        try:
+            from importlib import util
+            spec = util.spec_from_file_location(
+                "weekly_email",
+                str(Path(__file__).resolve().parent / "weekly_email.py"),
+            )
+            mod = util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+        except Exception as e:
+            self._json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": f"import: {e}"})
+            return
+
+        try:
+            sample = (
+                "# Wispr Thoughts is working\n"
+                "\n"
+                "Your **SMTP config** and keychain password are wired up correctly.\n"
+                "From now on, every week's digest will arrive in this inbox.\n"
+                "\n"
+                "## What you'll see each Sunday\n"
+                "\n"
+                "- The themes that surfaced in your dictation and meetings\n"
+                "- Problems you've been working on\n"
+                "- Cross-week patterns the auditor caught\n"
+                "\n"
+                "_You can stop these any time from the settings panel in the local viewer._\n"
+            )
+            mod.send_email("test", sample, partial=False)
+        except SystemExit as e:
+            self._json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(e)})
+            return
+        except Exception as e:
+            self._json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(e)})
+            return
+        self._json(HTTPStatus.OK, {"ok": True})
+
+    # ---- Backfill -----------------------------------------------------------
+
+    def _get_backfill(self) -> None:
+        """Report which weeks have raw data but no themes (yet)."""
+        unthemed = _unthemed_completed_weeks()
+        self._json(HTTPStatus.OK, {
+            "unthemed_count": len(unthemed),
+            "weeks": unthemed,
+        })
+
+    def _start_backfill(self) -> None:
+        global _CURRENT_JOB
+        with _JOB_LOCK:
+            if _CURRENT_JOB is not None and _CURRENT_JOB["status"] == "running":
+                self._json(HTTPStatus.CONFLICT, {
+                    "error": f"A {_CURRENT_JOB.get('kind', 'sync')} job is already running",
+                    "job_id": _CURRENT_JOB["id"],
+                })
+                return
+            unthemed = _unthemed_completed_weeks()
+            if not unthemed:
+                self._json(HTTPStatus.OK, {"ok": True, "note": "nothing to backfill"})
+                return
+            _CURRENT_JOB = _new_job()
+            _CURRENT_JOB["kind"] = "backfill"
+            _CURRENT_JOB["weeks"] = unthemed
+            job = _CURRENT_JOB
+        _start_backfill_thread(job, unthemed)
+        self._json(HTTPStatus.ACCEPTED, {
+            "job_id": job["id"],
+            "status": job["status"],
+            "weeks": unthemed,
+        })
+
+    # ---- Schedule -----------------------------------------------------------
+
+    def _get_schedule(self) -> None:
+        cfg = load_config()
+        s = cfg.get("schedule", {}) or {}
+        info = _schedule.status(
+            int(s.get("weekday", 0)),
+            int(s.get("hour", 9)),
+            int(s.get("minute", 0)),
+        )
+        self._json(HTTPStatus.OK, info)
+
+    def _post_schedule(self) -> None:
+        data = self._read_json_body()
+        if data is None:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid JSON"})
+            return
+        cfg = load_config()
+        s = cfg.get("schedule", {}) or {}
+        weekday = int(data.get("weekday", s.get("weekday", 0)))
+        hour    = int(data.get("hour",    s.get("hour", 9)))
+        minute  = int(data.get("minute",  s.get("minute", 0)))
+        enabled = bool(data.get("enabled", True))
+
+        # Persist schedule values (so subsequent restarts see the same time)
+        try:
+            _settings.write_keys({
+                ("schedule", "weekday"): weekday,
+                ("schedule", "hour"):    hour,
+                ("schedule", "minute"):  minute,
+            })
+        except Exception as exc:
+            self._json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": f"write: {exc}"})
+            return
+
+        if enabled:
+            r = _schedule.install(weekday, hour, minute)
+        else:
+            r = _schedule.remove()
+        if not r.get("ok"):
+            self._json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": r.get("output", "schedule failed")})
+            return
+        self._json(HTTPStatus.OK, {"ok": True, "info": _schedule.status(weekday, hour, minute)})
 
     # ---- Helpers ------------------------------------------------------------
 

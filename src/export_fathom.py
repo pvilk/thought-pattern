@@ -64,10 +64,20 @@ def api_get(path: str, params: dict, key: str) -> dict:
 
 
 def list_meetings(key: str, since: str | None) -> list[dict]:
+    """Page through /meetings with transcript + summary inlined.
+
+    Fathom's per-meeting `/meetings/{id}/transcript` endpoint 404s; the
+    supported path is to request `include_transcript=true&include_summary=true`
+    on the listing endpoint and pull both bodies out of each item.
+    """
     out = []
     cursor = None
     while True:
-        params = {"limit": 100}
+        params = {
+            "limit": 100,
+            "include_transcript": "true",
+            "include_summary": "true",
+        }
         if cursor:
             params["cursor"] = cursor
         if since:
@@ -81,13 +91,10 @@ def list_meetings(key: str, since: str | None) -> list[dict]:
     return out
 
 
-def fetch_transcript(meeting_id: str, key: str) -> dict:
-    return api_get(f"/meetings/{meeting_id}/transcript", {}, key)
-
-
-def write_meeting(meeting: dict, transcript: dict, force: bool) -> Path | None:
-    mid = str(meeting.get("id"))
-    title = meeting.get("meeting_title") or meeting.get("title", "Untitled")
+def write_meeting(meeting: dict, force: bool) -> Path | None:
+    """Write one meeting markdown file. Reads transcript/summary inlined on the meeting."""
+    mid = str(meeting.get("recording_id") or meeting.get("id") or "")
+    title = meeting.get("meeting_title") or meeting.get("title") or "Untitled"
     started = meeting.get("started_at") or meeting.get("created_at")
     if not started or not mid:
         return None
@@ -104,14 +111,28 @@ def write_meeting(meeting: dict, transcript: dict, force: bool) -> Path | None:
              f"- **Source:** Fathom",
              f"- **URL:** {meeting.get('share_url') or meeting.get('url', '')}",
              ""]
-    summary = meeting.get("summary") or meeting.get("ai_summary")
+    summary = (
+        meeting.get("default_summary_markdown_formatted")
+        or meeting.get("summary")
+        or meeting.get("ai_summary")
+    )
     if summary:
         lines += ["## Summary", "", str(summary).strip(), ""]
-    turns = transcript.get("transcript", []) or transcript.get("turns", [])
-    if turns:
+    turns = (
+        meeting.get("transcript_messages")
+        or meeting.get("transcript")
+        or meeting.get("turns")
+        or []
+    )
+    if isinstance(turns, list) and turns:
         lines += ["## Transcript", ""]
         for i, turn in enumerate(turns):
-            speaker = turn.get("speaker", {}).get("name") or turn.get("speaker_name") or ""
+            if not isinstance(turn, dict):
+                continue
+            speaker = (
+                (turn.get("speaker") or {}).get("name")
+                if isinstance(turn.get("speaker"), dict) else None
+            ) or turn.get("speaker_name") or turn.get("speaker") or ""
             text = (turn.get("text") or turn.get("content") or "").strip()
             if not text:
                 continue
@@ -136,17 +157,17 @@ def main() -> None:
     ap.add_argument("--refresh", action="store_true")
     args = ap.parse_args()
 
-    print("Listing meetings…")
+    print("Listing meetings (with transcripts inlined)…")
     meetings = list_meetings(key, args.since)
-    print(f"Got {len(meetings)} meetings; downloading transcripts…")
+    print(f"Got {len(meetings)} meetings; writing markdown…")
     written = 0
     for m in meetings:
         try:
-            t = fetch_transcript(str(m.get("id")), key)
-            if write_meeting(m, t, args.refresh):
+            if write_meeting(m, args.refresh):
                 written += 1
         except Exception as e:
-            sys.stderr.write(f"  failed {m.get('id')}: {e}\n")
+            mid = m.get("recording_id") or m.get("id")
+            sys.stderr.write(f"  failed {mid}: {e}\n")
     print(f"Done. {written} meetings written to {MEETINGS_DIR}")
 
 
